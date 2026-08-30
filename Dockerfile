@@ -31,6 +31,9 @@ FROM nginx:alpine
 
 # 拷贝自定义 Nginx 配置与启动入口（入口会把监听端口改为 Railway 注入的 $PORT）
 COPY 01_source_main_demo/fraud-pet-demo/nginx.conf /etc/nginx/conf.d/default.conf
+# Railway 单容器没有 `backend` 服务，nginx 启动时解析该主机名会失败。
+# 改为指向本机 127.0.0.1，保证 nginx 能正常启动；运行时 /api/ 会 502（预期，无后端）。
+RUN sed -i 's|proxy_pass http://backend:8000/api/;|proxy_pass http://127.0.0.1:8000/api/;|' /etc/nginx/conf.d/default.conf
 COPY 01_source_main_demo/fraud-pet-demo/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
