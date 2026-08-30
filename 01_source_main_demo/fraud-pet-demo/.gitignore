@@ -1,0 +1,39 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+backend/data/*.sqlite3
+backend/data/*.sqlite3-*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 运行时产物 / 垃圾文件（避免提交日志、本地库与误入仓库的临时文件）
+backend/*.log
+backend/*.db
+backend/act_err.json
+backend/dash2.json
+backend/=6.0
+*.sqlite3
+*.sqlite3-*
+
+# 本地环境变量（仅开发用，含体验账号，勿提交）
+.env
+.env.local

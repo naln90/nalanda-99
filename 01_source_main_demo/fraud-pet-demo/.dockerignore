@@ -1,0 +1,16 @@
+# Docker 忽略文件
+node_modules
+dist
+.venv
+backend/.venv
+backend/__pycache__
+backend/app/__pycache__
+**/*.pyc
+.git
+.gitignore
+*.md
+.vscode
+.idea
+backend/data
+backend/tests
+coverage

@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn==0.32.1
+SQLAlchemy==2.0.36
+pydantic>=2.0
+pytest==8.3.4
+httpx==0.28.1
+aiofiles>=23.0
+alembic>=1.13
+python-multipart>=0.0.5
+requests>=2.31  # fetch_videos.py：Pexels 主题视频直链抓取工具依赖

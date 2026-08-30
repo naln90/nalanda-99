@@ -1,0 +1,10 @@
+# 排除本地开发 / 备份 / 运行产物，避免打进后端镜像
+app_bak_imports_*
+app_pre_split_backup_*
+backend.log
+__pycache__
+*.pyc
+.pytest_cache
+data
+tests
+.venv

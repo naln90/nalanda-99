@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>重置会话 - 防诈智研</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background: #f8fafc;
+      color: #1e293b;
+    }
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 48px 40px;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+      text-align: center;
+      max-width: 400px;
+    }
+    .icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { font-size: 14px; color: #64748b; margin: 0 0 24px; line-height: 1.6; }
+    .status { font-size: 13px; color: #10b981; margin-bottom: 16px; }
+    a {
+      display: inline-block;
+      padding: 12px 32px;
+      background: #6366f1;
+      color: white;
+      text-decoration: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      transition: background 0.2s;
+    }
+    a:hover { background: #4f46e5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🐾</div>
+    <h1>会话已重置</h1>
+    <p class="status" id="status">正在清除本地数据...</p>
+    <p>系统已重置到"未选择宠物"状态，<br />请重新登录并选择你的守护伙伴。</p>
+    <a href="/" id="goHome">前往登录</a>
+  </div>
+  <script>
+    // 清除 localStorage 中的会话数据
+    localStorage.removeItem('fzzy.session');
+    // 清除可能的其他缓存
+    sessionStorage.clear();
+    document.getElementById('status').textContent = '✅ 本地数据已清除';
+    // 3秒后自动跳转
+    setTimeout(function() {
+      window.location.href = '/';
+    }, 2000);
+  </script>
+</html>

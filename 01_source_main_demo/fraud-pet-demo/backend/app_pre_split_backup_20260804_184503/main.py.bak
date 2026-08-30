@@ -1,0 +1,2693 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import secrets
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, func, inspect, select, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from .models import (
+    Account,
+    AICallLog,
+    AbilityEvent,
+    AbilitySnapshot,
+    AssessmentAnswer as AssessmentAnswerRecord,
+    AssessmentResult,
+    AssessmentSession,
+    Base,
+    EvidenceRecord,
+    FraudCase,
+    GrowthRule,
+    KnowledgeItem,
+    Pet,
+    PetPool,
+    QuestionMetadata,
+    RetrainTask,
+    ReviewReport,
+    ScenarioTrainingSession,
+    SuspiciousCheck,
+    TaskPackage,
+    TaskPackageItem,
+    TrainingQuestion,
+    TrainingRecord,
+    TrainingTask,
+    User,
+)
+from .rules import (
+    COMPLIANCE_NOTICE,
+    DAILY_MAX_GROWTH,
+    SUSPICIOUS_CHECK_DAILY_LIMIT,
+    TASK_MAX_GROWTH,
+    analyze_text,
+    mask_text,
+    pet_level,
+    pet_stage,
+    same_day,
+    training_growth,
+)
+
+
+# 管理端可在后台调整的成长规则键；保存时强制要求为数值，避免脏数据
+_NUMERIC_RULE_KEYS = {"dailyMaxGrowth", "taskMaxGrowth", "suspiciousCheckDailyLimit"}
+
+
+def get_rule_value(session: Session, key: str, default: int) -> int:
+    """读取管理端配置的成长规则（GrowthRule）。
+
+    让后台配置的成长值上限在训练结算、可疑信息判断等场景中真正生效；
+    当规则缺失或取值无法解析为 int 时，安全回退到传入的默认值。
+    """
+    try:
+        rule = session.scalar(select(GrowthRule).where(GrowthRule.rule_key == key))
+        if rule is not None:
+            return int(rule.rule_value)
+    except (ValueError, TypeError):
+        logger.warning("成长规则 %s 取值无法解析，回退默认值 %s", key, default)
+    return default
+
+
+def gen_token() -> str:
+    """生成登录令牌。"""
+    return secrets.token_urlsafe(24)
+
+
+def resolve_owner_id(request: Request, db: Session, payload_owner_id: str) -> str:
+    """软绑定身份：携带合法 Bearer Token 时以 Token 对应的 owner_id 为准，防止客户端伪造 ownerId；
+    无 Token（demo 直登路径）则回退 payload.ownerId，保证演示链路不受影响。"""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):].strip()
+        if token:
+            owner = db.scalar(select(User).where(User.token == token))
+            if owner:
+                return owner.owner_id
+    return payload_owner_id
+
+
+_ADMIN_KEY_WARNED = False
+
+
+def require_admin_key(request: Request) -> None:
+    """保护 /api/admin 管理端点。
+
+    配置环境变量 ADMIN_API_KEY 后强制校验 X-Admin-Key 头；未配置时 fail-open 放行
+    （仅告警一次），以保证未部署密钥的演示环境仍可正常演示。
+    """
+    global _ADMIN_KEY_WARNED
+    expected = os.getenv("ADMIN_API_KEY")
+    if not expected:
+        if not _ADMIN_KEY_WARNED:
+            logger.warning("ADMIN_API_KEY 未配置，/api/admin 端点当前未受保护（演示态放行）")
+            _ADMIN_KEY_WARNED = True
+        return
+    provided = request.headers.get("X-Admin-Key", "")
+    if not provided or provided != expected:
+        raise HTTPException(status_code=401, detail="未授权的管理端访问")
+
+
+from .scenarios import scenario_response
+from .seed import pet_to_response, seed_database
+from .ai_service import AIService, is_llm_available, MODEL_NAME
+from .assessment_service import (
+    MODE_CONFIG,
+    create_session as create_assessment_session,
+    record_answer as record_assessment_answer,
+    finalize_session as finalize_assessment_session,
+    seed_question_metadata,
+)
+from .risk_test_samples import seed_risk_test_samples
+from .image_analysis import analyze_image
+from .question_bank import ALL_QUESTIONS
+
+logger = logging.getLogger(__name__)
+
+# 测评题库：从 question_bank.py 导入全部 35 题，将 snake_case 键名转换为 camelCase
+# 以兼容 API 返回格式和 compute_ability_profile 函数
+_KEY_MAP = {
+    "question_type": "questionType",
+    "fraud_type": "fraudType",
+    "ability_dim": "abilityDim",
+    "risk_stage": "riskStage",
+    "evidence_tags": "evidenceTags",
+    "correct_answer": "correctAnswer",
+}
+ASSESSMENT_QUESTIONS = [
+    {_KEY_MAP.get(k, k): v for k, v in q.items()} for q in ALL_QUESTIONS
+]
+
+
+class DemoLoginRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=20)
+    password: str = Field(min_length=6, max_length=40)
+    nickname: str = Field(default="", max_length=20)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
+class AssessmentAnswer(BaseModel):
+    questionId: str
+    answer: Any = None
+
+
+class AssessmentSubmitRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    answers: list[AssessmentAnswer] = Field(default_factory=list)
+
+
+# ── v1 测评 API 请求模型（Phase 1.2）──
+
+class CreateSessionRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    mode: str = Field(default="quick")  # "quick" | "standard"
+
+
+class SubmitAnswerRequest(BaseModel):
+    sessionId: str = Field(min_length=1)
+    questionId: str = Field(min_length=1)
+    answer: Any
+
+
+class CompleteSessionRequest(BaseModel):
+    sessionId: str = Field(min_length=1)
+
+
+class PetClaimRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    petType: str = Field(min_length=1)
+    petName: str | None = Field(default=None, max_length=20)
+    avatarEmoji: str | None = Field(default=None, max_length=8)
+
+
+class PetProfileUpdateRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    petName: str | None = Field(default=None, max_length=20)
+    avatarEmoji: str | None = Field(default=None, max_length=8)
+
+
+class TrainingAnswer(BaseModel):
+    questionId: str
+    answer: Any = None
+
+
+class TrainingSubmitRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    taskId: str = Field(min_length=1)
+    answers: list[TrainingAnswer] = Field(default_factory=list, max_length=500)
+    mode: str = "recommended"
+
+
+class RiskAnalyzeRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=2000)
+    sourceType: str = "聊天记录"
+
+
+class CaseCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    fraudType: str = "综合诈骗风险"
+    sourceChannel: str = "手工录入"
+    riskLevel: str = "中风险"
+    summary: str = Field(default="", max_length=2000)
+
+
+# ==================== 整改新增请求模型 ====================
+
+class ScenarioStartRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    taskId: str = Field(min_length=1)
+
+
+class ScenarioReplyRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    message: str = Field(min_length=1, max_length=1000)
+
+
+class ScenarioFinishRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+
+
+# ---------- v1 情景训练 请求模型 ----------
+class ScenarioStartV1Request(BaseModel):
+    ownerId: str = Field(min_length=1)
+    scenarioType: str = Field(min_length=1, max_length=40)  # "刷单返利" | "游戏交易" | ...
+
+
+class ScenarioReplyV1Request(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+
+
+class TaskPackageGenerateRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    planType: str = "7day"  # "7day" | "14day"
+
+
+class TaskPackageItemCompleteRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+    score: float | None = None
+
+
+class EmergencyStopLossRequest(BaseModel):
+    selectedRisks: list[str] = Field(default_factory=list, max_length=20)
+
+
+class DashboardRequest(BaseModel):
+    ownerId: str = Field(min_length=1)
+
+
+# 进程内锁：保证同一进程内多线程并发提交同一用户训练时，
+# 「幂等校验 + 发奖 + 落库」原子执行，避免重复发奖（边界/健壮性 A14）
+_award_lock = threading.Lock()
+
+
+def default_database_url() -> str:
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    data_dir.mkdir(exist_ok=True)
+    return f"sqlite:///{data_dir / 'demo.sqlite3'}"
+
+
+def create_engine_for_url(database_url: str) -> Engine:
+    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    return create_engine(database_url, connect_args=connect_args, future=True)
+
+
+def user_to_response(user: User) -> dict[str, object]:
+    return {
+        "ownerId": user.owner_id,
+        "hasCompletedAssessment": user.has_completed_assessment,
+        "hasPet": user.has_pet,
+        "role": getattr(user, "role", "student"),
+    }
+
+
+def hash_password(password: str, salt: str = "") -> str:
+    if not salt:
+        salt = secrets.token_hex(8)
+    digest = hashlib.sha256(f"{salt}:{password}".encode("utf-8")).hexdigest()
+    return f"{salt}${digest}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if "$" not in stored:
+        return False
+    salt, _ = stored.split("$", 1)
+    return hash_password(password, salt) == stored
+
+
+def generate_owner_id(db: Session) -> str:
+    """生成形如 U-XXXX** 的匿名主人ID，后两位脱敏，保护隐私。"""
+    for _ in range(20):
+        candidate = f"U-{secrets.randbelow(9000) + 1000}**"
+        if not db.scalar(select(Account).where(Account.owner_id == candidate)) and not db.scalar(
+            select(User).where(User.owner_id == candidate)
+        ):
+            return candidate
+    # 极端情况下用时间戳兜底
+    return f"U-{int(datetime.utcnow().timestamp()) % 10000}**"
+
+
+def task_to_response(task: TrainingTask) -> dict[str, object]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "fraudType": task.fraud_type,
+        "riskLevel": task.risk_level,
+        "difficulty": task.difficulty,
+        "duration": f"{task.duration_minutes} 分钟",
+        "reward": task.max_reward,
+    }
+
+
+def get_or_create_user(db: Session, owner_id: str) -> User:
+    user = db.scalar(select(User).where(User.owner_id == owner_id))
+    if user:
+        return user
+    user = User(owner_id=owner_id)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def get_pet(db: Session, owner_id: str) -> Pet | None:
+    return db.scalar(select(Pet).where(Pet.owner_id == owner_id))
+
+
+def apply_growth(pet: Pet, growth: int) -> None:
+    if growth <= 0:
+        return
+    pet.growth_value += growth
+    pet.level = pet_level(pet.growth_value)
+    pet.stage = pet_stage(pet.level)
+    pet.last_training_at = datetime.utcnow()
+
+
+def normalize_answer(value: Any) -> set[str]:
+    if isinstance(value, list):
+        return {str(item) for item in value}
+    if value is None:
+        return set()
+    return {str(value)}
+
+
+def score_answers(db: Session, task_id: str, answers: list[TrainingAnswer]) -> float:
+    questions = db.scalars(select(TrainingQuestion).where(TrainingQuestion.task_id == task_id)).all()
+    if not questions:
+        return 0.0
+    provided = {answer.questionId: normalize_answer(answer.answer) for answer in answers}
+    correct = 0
+    for question in questions:
+        correct_answer = normalize_answer(json.loads(question.correct_answer_json))
+        if provided.get(question.id, set()) == correct_answer:
+            correct += 1
+    return correct / len(questions)
+
+
+def awarded_training_today(db: Session, owner_id: str, task_id: str | None = None) -> list[TrainingRecord]:
+    # 将「今日 + 指定任务」下推到 SQL，避免随着使用时间推移把历史获奖记录全部捞回再在内存过滤（性能 R2）
+    filters = [
+        TrainingRecord.owner_id == owner_id,
+        TrainingRecord.reward_status == "AWARDED",
+        func.date(TrainingRecord.created_at) == func.current_date(),
+    ]
+    if task_id is not None:
+        filters.append(TrainingRecord.task_id == task_id)
+    records = db.scalars(select(TrainingRecord).where(*filters)).all()
+    # 用 same_day 兜底，确保与既有 UTC 口径完全一致（防止 DB 时区与 func.current_date 偏差）
+    return [record for record in records if same_day(record.created_at)]
+
+
+def daily_awarded_growth(db: Session, owner_id: str) -> int:
+    training = db.scalar(
+        select(func.coalesce(func.sum(TrainingRecord.final_growth), 0)).where(
+            TrainingRecord.owner_id == owner_id,
+            TrainingRecord.reward_status == "AWARDED",
+            func.date(TrainingRecord.created_at) == func.current_date(),
+        )
+    )
+    checks = db.scalar(
+        select(func.coalesce(func.sum(SuspiciousCheck.growth_awarded), 0)).where(
+            SuspiciousCheck.owner_id == owner_id,
+            SuspiciousCheck.reward_status == "AWARDED",
+            func.date(SuspiciousCheck.created_at) == func.current_date(),
+        )
+    )
+    return int(training or 0) + int(checks or 0)
+
+
+def _migrate_pets_table(engine: Engine) -> None:
+    """为旧版数据库补充 pet_name / avatar_emoji 列，保持向后兼容。"""
+    inspector = inspect(engine)
+    if "pets" not in inspector.get_table_names():
+        return
+    existing_columns = {col["name"] for col in inspector.get_columns("pets")}
+    with engine.begin() as conn:
+        if "pet_name" not in existing_columns:
+            conn.execute(text("ALTER TABLE pets ADD COLUMN pet_name VARCHAR"))
+        if "avatar_emoji" not in existing_columns:
+            conn.execute(text("ALTER TABLE pets ADD COLUMN avatar_emoji VARCHAR"))
+
+
+def _migrate_v3_columns(engine: Engine) -> None:
+    """V3.0 向后兼容迁移：为已有库补充 role / 活动共建字段。"""
+    inspector = inspect(engine)
+
+    def _add(table: str, column: str, ctype: str) -> None:
+        if table not in inspector.get_table_names():
+            return
+        cols = {c["name"] for c in inspector.get_columns(table)}
+        if column not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}"))
+
+    _add("accounts", "role", "VARCHAR")
+    _add("users", "role", "VARCHAR")
+    _add("users", "token", "VARCHAR")
+    _add("campus_activities", "target_energy", "INTEGER")
+    _add("campus_activities", "current_progress", "INTEGER")
+    _add("campus_activities", "contributor_count", "INTEGER")
+    _add("campus_activities", "status", "VARCHAR")
+    _add("campus_activities", "notice_text", "TEXT")
+    _add("campus_activities", "released_at", "DATETIME")
+    _add("learning_plan_items", "energy_reward", "INTEGER")
+
+    # 向后兼容：迁移加列时旧活动行的共建字段为 NULL，在此补齐默认值。
+    if "campus_activities" in inspector.get_table_names():
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE campus_activities SET target_energy = 1000 WHERE target_energy IS NULL"))
+            conn.execute(text("UPDATE campus_activities SET current_progress = 0 WHERE current_progress IS NULL"))
+            conn.execute(text("UPDATE campus_activities SET contributor_count = 0 WHERE contributor_count IS NULL"))
+            conn.execute(text("UPDATE campus_activities SET status = 'building' WHERE status IS NULL"))
+
+
+def create_app(database_url: str | None = None) -> FastAPI:
+    engine = create_engine_for_url(database_url or os.getenv("DATABASE_URL") or default_database_url())
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    Base.metadata.create_all(engine)
+    # 轻量级迁移：为已存在的 pets 表补充新字段（向后兼容旧库）
+    _migrate_pets_table(engine)
+    _migrate_v3_columns(engine)
+    with SessionLocal() as session:
+        seed_database(session)
+        seed_question_metadata(session)
+        seed_risk_test_samples(session)
+
+    def get_db() -> Session:
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = FastAPI(title="防诈智研 Demo API", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # 统一异常处理：避免将内部异常信息/堆栈直接暴露给前端（S6/R1）
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(request: Request, exc: Exception):
+        logger.exception("未捕获异常: %s", request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "detail": "服务器内部错误，请稍后重试"},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={"success": False, "detail": "请求参数校验失败", "errors": exc.errors()},
+        )
+    # AI 学习集市主链路使用独立路由模块，保留原有反诈训练 API 的兼容性。
+    from .learning_market import create_learning_market_router
+
+    app.include_router(create_learning_market_router(get_db))
+
+    # V3.0 双端口 & 统一盾能体系路由
+    from .v3_routes import (
+        create_activity_router,
+        create_energy_router,
+        create_school_router,
+        create_theme_router,
+    )
+
+    app.include_router(create_theme_router(get_db))
+    app.include_router(create_energy_router(get_db))
+    app.include_router(create_activity_router(get_db))
+    app.include_router(create_school_router(get_db))
+
+    @app.get("/api/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/api/auth/demo-login")
+    def demo_login(payload: DemoLoginRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        user = get_or_create_user(db, payload.ownerId)
+        # 签发并持久化令牌：demo 直登也纳入统一令牌体系，便于后续接口按 Token 绑定身份
+        user.token = gen_token()
+        db.commit()
+        return {
+            "currentUser": user_to_response(user),
+            "hasCompletedAssessment": user.has_completed_assessment,
+            "hasPet": user.has_pet,
+            "token": user.token,
+        }
+
+    @app.post("/api/auth/register")
+    def auth_register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        username = payload.username.strip()
+        if db.scalar(select(Account).where(Account.username == username)):
+            raise HTTPException(status_code=409, detail="该账号名已被注册，请更换")
+        owner_id = generate_owner_id(db)
+        account = Account(
+            username=username,
+            password_hash=hash_password(payload.password),
+            owner_id=owner_id,
+            nickname=payload.nickname.strip() or username,
+        )
+        db.add(account)
+        # 同步创建 User 记录，保证后续业务可直接通过 owner_id 取到用户状态
+        user = User(owner_id=owner_id)
+        user.token = gen_token()
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return {
+            "currentUser": user_to_response(user),
+            "hasCompletedAssessment": user.has_completed_assessment,
+            "hasPet": user.has_pet,
+            "nickname": account.nickname,
+            "token": user.token,
+        }
+
+    @app.post("/api/auth/login")
+    def auth_login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        account = db.scalar(select(Account).where(Account.username == payload.username.strip()))
+        if not account or not verify_password(payload.password, account.password_hash):
+            raise HTTPException(status_code=401, detail="账号或密码错误")
+        user = get_or_create_user(db, account.owner_id)
+        # 每次登录轮换令牌，旧令牌自动失效
+        user.token = gen_token()
+        db.commit()
+        return {
+            "currentUser": user_to_response(user),
+            "hasCompletedAssessment": user.has_completed_assessment,
+            "hasPet": user.has_pet,
+            "nickname": account.nickname,
+            "token": user.token,
+        }
+
+    @app.get("/api/assessment/questions")
+    def assessment_questions(count: int = Query(default=5, ge=3, le=10)) -> dict[str, object]:
+        # 支持极速测评(3题)/默认测评(5题)/完整测评(8-10题)
+        selected = ASSESSMENT_QUESTIONS[:count]
+        return {
+            "questions": [
+                {
+                    "id": q["id"],
+                    "questionType": q["questionType"],
+                    "fraudType": q["fraudType"],
+                    "stem": q["stem"],
+                    "options": q["options"],
+                    "correctAnswer": q["correctAnswer"],
+                    "explanation": q["explanation"],
+                }
+                for q in selected
+            ]
+        }
+
+    @app.post("/api/assessment/submit")
+    def submit_assessment(payload: AssessmentSubmitRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        user = get_or_create_user(db, payload.ownerId)
+        user.has_completed_assessment = True
+        user.updated_at = datetime.utcnow()
+        db.commit()
+        # 根据真实答案计算正确率、薄弱类型和五维能力画像
+        question_map = {q["id"]: q for q in ASSESSMENT_QUESTIONS}
+        correct_count = 0
+        wrong_types: list[str] = []
+        wrong_questions: list[str] = []
+        for answer in payload.answers:
+            question = question_map.get(answer.questionId)
+            if not question:
+                continue
+            provided = normalize_answer(answer.answer)
+            correct_answer = normalize_answer(question["correctAnswer"])
+            if provided == correct_answer:
+                correct_count += 1
+            else:
+                if question["fraudType"] not in wrong_types:
+                    wrong_types.append(question["fraudType"])
+                wrong_questions.append(question["id"])
+        total = len(payload.answers) if payload.answers else 1
+        accuracy = round(correct_count / total, 2)
+
+        # 计算五维能力画像（整改核心升级）
+        from .ability_profile import compute_ability_profile
+        answers_for_profile = [
+            {
+                "questionId": ans.questionId,
+                "selected": list(normalize_answer(ans.answer)),
+            }
+            for ans in payload.answers
+        ]
+        profile = compute_ability_profile(answers_for_profile, ASSESSMENT_QUESTIONS)
+
+        # 保存测评结果（含五维画像）
+        result = AssessmentResult(
+            owner_id=payload.ownerId,
+            mode="quick" if total <= 5 else "standard",
+            total_questions=total,
+            correct_count=correct_count,
+            accuracy=accuracy,
+            ability_profile_json=json.dumps(profile["scores"], ensure_ascii=False),
+            wrong_questions_json=json.dumps(wrong_questions, ensure_ascii=False),
+            weak_dimensions_json=json.dumps(profile["weakDimensions"], ensure_ascii=False),
+        )
+        db.add(result)
+        db.commit()
+
+        growth_awarded = 30 if accuracy >= 0.6 else 20
+        return {
+            "accuracy": accuracy,
+            "correctCount": correct_count,
+            "totalCount": len(payload.answers),
+            "weakAreas": wrong_types[:3] if wrong_types else ["暂无明显薄弱项，建议保持学习"],
+            "abilityProfile": profile,
+            "growthAwarded": growth_awarded,
+            "unlockedPetPool": True,
+            "currentUser": user_to_response(user),
+        }
+
+    # ── v1 测评 API（Phase 1.2：基于 AssessmentSession 的会话式测评）──
+
+    @app.post("/api/v1/assessment/sessions")
+    def v1_create_session(payload: CreateSessionRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """创建测评会话，按模式分层随机抽取题目。
+
+        mode 可选：quick（10题快速）/ standard（20题标准）
+        返回会话信息 + 完整题目列表（不含正确答案）。
+        """
+        if payload.mode not in MODE_CONFIG:
+            raise HTTPException(400, f"Unknown mode: {payload.mode}. Valid: {list(MODE_CONFIG.keys())}")
+
+        sess, questions = create_assessment_session(db, payload.ownerId, payload.mode)
+
+        # 验证题库充足
+        if len(questions) < MODE_CONFIG[payload.mode]["total_questions"]:
+            raise HTTPException(500, "题库不足，请联系管理员补充题库")
+
+        # 返回前端需要的题目格式（不含正确答案，由服务端事后判断）
+        question_items: list[dict[str, object]] = []
+        for q in questions:
+            question_items.append({
+                "id": q.id,
+                "questionType": q.question_type,
+                "fraudType": q.fraud_type,
+                "abilityDim": q.ability_dim,
+                "riskStage": q.risk_stage,
+                "stem": q.stem,
+                "options": json.loads(q.options_json),
+                "difficulty": q.difficulty,
+            })
+
+        return {
+            "sessionId": sess.id,
+            "mode": sess.mode,
+            "totalQuestions": sess.total_questions,
+            "startedAt": sess.started_at.isoformat(),
+            "questions": question_items,
+        }
+
+    @app.get("/api/v1/assessment/sessions/{session_id}")
+    def v1_get_session(session_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+        """获取测评会话状态和进度。"""
+        sess = db.get(AssessmentSession, session_id)
+        if not sess:
+            raise HTTPException(404, f"Session not found: {session_id}")
+
+        answers = (
+            db.query(AssessmentAnswerRecord)
+            .filter(AssessmentAnswerRecord.session_id == session_id)
+            .order_by(AssessmentAnswerRecord.created_at)
+            .all()
+        )
+        answered_ids = {a.question_id for a in answers}
+
+        # 重新加载题目以构建完整题目列表
+        all_qs = db.query(QuestionMetadata).filter(QuestionMetadata.enabled.is_(True)).all()
+
+        return {
+            "sessionId": sess.id,
+            "ownerId": sess.owner_id,
+            "mode": sess.mode,
+            "status": sess.status,
+            "totalQuestions": sess.total_questions,
+            "completedQuestions": sess.completed_questions,
+            "startedAt": sess.started_at.isoformat(),
+            "completedAt": sess.completed_at.isoformat() if sess.completed_at else None,
+            "answeredIds": list(answered_ids),
+        }
+
+    @app.post("/api/v1/assessment/sessions/answer")
+    def v1_submit_answer(payload: SubmitAnswerRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """提交单题答案，记录到 assessment_answers 表。
+
+        返回反馈：correct, score（0-1）, correctAnswer, explanation。
+        """
+        sess = db.get(AssessmentSession, payload.sessionId)
+        if not sess:
+            raise HTTPException(404, f"Session not found: {payload.sessionId}")
+        if sess.status != "in_progress":
+            raise HTTPException(400, f"Session already {sess.status}")
+
+        question = db.get(QuestionMetadata, payload.questionId)
+        if not question:
+            raise HTTPException(404, f"Question not found: {payload.questionId}")
+
+        # 检查是否已答过此题
+        existing = (
+            db.query(AssessmentAnswerRecord)
+            .filter(
+                AssessmentAnswerRecord.session_id == payload.sessionId,
+                AssessmentAnswerRecord.question_id == payload.questionId,
+            )
+            .first()
+        )
+        if existing:
+            # 已答过，返回已有结果
+            return {
+                "isCorrect": existing.is_correct,
+                "score": existing.score,
+                "correctAnswer": json.loads(question.correct_answer_json),
+                "explanation": question.explanation,
+                "alreadyAnswered": True,
+            }
+
+        # 记录答案
+        answer_record = record_assessment_answer(db, sess, question, payload.answer)
+
+        return {
+            "isCorrect": answer_record.is_correct,
+            "score": answer_record.score,
+            "correctAnswer": json.loads(question.correct_answer_json),
+            "explanation": question.explanation,
+            "alreadyAnswered": False,
+        }
+
+    @app.post("/api/v1/assessment/sessions/complete")
+    def v1_complete_session(payload: CompleteSessionRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """完成测评会话，计算五维能力画像并返回评价结果。（幂等：重复调用安全）"""
+        sess = db.get(AssessmentSession, payload.sessionId)
+        if not sess:
+            raise HTTPException(404, f"Session not found: {payload.sessionId}")
+
+        # finalize_session 本身幂等：已完成的会话不再重复写入 AssessmentResult
+        result = finalize_assessment_session(db, sess)
+
+        user = get_or_create_user(db, sess.owner_id)
+        growth_awarded = 30 if result["accuracy"] >= 0.6 else 20
+
+        return {
+            "sessionId": sess.id,
+            "mode": result["mode"],
+            "totalQuestions": result["total_questions"],
+            "correctCount": result["correct_count"],
+            "accuracy": result["accuracy"],
+            "abilityProfile": {
+                "scores": result["ability_profile"],
+                "weakDimensions": result["weak_dimensions"],
+                "overallScore": round(sum(result["ability_profile"].values()) / len(result["ability_profile"]), 1) if result["ability_profile"] else 0,
+            },
+            "weakAreas": result["weak_areas"][:3] if result["weak_areas"] else ["暂无明显薄弱项，建议保持学习"],
+            "wrongQuestions": result["wrong_questions"],
+            "growthAwarded": growth_awarded,
+            "unlockedPetPool": True,
+            "currentUser": user_to_response(user),
+        }
+
+    # ── v1 能力画像 API（Phase 1.3：五维能力画像 + 历史快照趋势）──
+    @app.get("/api/v1/assessment/ability-profile")
+    def v1_ability_profile(
+        ownerId: str = Query("U-2408**"),
+        includeHistory: bool = Query(False, alias="includeHistory"),
+        db: Session = Depends(get_db),
+    ) -> dict[str, object]:
+        """获取用户五维能力画像（v1）。
+        
+        - 返回最新测评的画像数据
+        - 可选返回历史快照数组用于趋势图
+        - 能力等级完全由规则计算，不依赖 AI
+        """
+        from .ability_profile import ABILITY_DIMENSIONS, DIMENSION_DESCRIPTIONS, DIMENSION_SUGGESTIONS
+
+        latest = (
+            db.query(AssessmentResult)
+            .filter(AssessmentResult.owner_id == ownerId)
+            .order_by(AssessmentResult.created_at.desc())
+            .first()
+        )
+        if not latest:
+            return {"profile": None, "hasCompletedAssessment": False, "message": "尚未完成测评，请先参与能力测评"}
+
+        scores = json.loads(latest.ability_profile_json)
+        weak_dimensions = json.loads(latest.weak_dimensions_json)
+
+        overall = round(sum(scores.values()) / len(ABILITY_DIMENSIONS), 1)
+        strong_dimensions = [d for d in ABILITY_DIMENSIONS if scores.get(d, 0) >= 80]
+
+        # 能力等级（与服务端规则一致）
+        def _compute_level(score: float) -> str:
+            if score >= 85:
+                return "防诈达人"
+            elif score >= 70:
+                return "防诈能手"
+            elif score >= 50:
+                return "防诈新手"
+            else:
+                return "防诈入门"
+
+        def _compute_pet_stage(score: float) -> str:
+            if score >= 85:
+                return "王者"
+            elif score >= 70:
+                return "精英"
+            elif score >= 50:
+                return "成长"
+            else:
+                return "萌新"
+
+        dimensions = []
+        for dim in ABILITY_DIMENSIONS:
+            score = scores.get(dim, 0)
+            dimensions.append({
+                "dimension": dim,
+                "score": score,
+                "maxScore": 100,
+                "percentage": score,
+                "description": DIMENSION_DESCRIPTIONS.get(dim, ""),
+                "suggestion": DIMENSION_SUGGESTIONS.get(dim, ""),
+            })
+
+        profile = {
+            "dimensions": dimensions,
+            "scores": scores,
+            "overallScore": overall,
+            "weakDimensions": weak_dimensions,
+            "strongDimensions": strong_dimensions,
+            "level": _compute_level(overall),
+            "petStage": _compute_pet_stage(overall),
+            "assessmentTime": latest.created_at.isoformat(),
+        }
+
+        response_data: dict[str, object] = {
+            "profile": profile,
+            "hasCompletedAssessment": True,
+        }
+
+        # 可选：历史快照趋势
+        if includeHistory:
+            snapshots = (
+                db.query(AbilitySnapshot)
+                .filter(AbilitySnapshot.owner_id == ownerId)
+                .order_by(AbilitySnapshot.created_at.asc())
+                .all()
+            )
+            history = []
+            for snap in snapshots:
+                snap_scores = json.loads(snap.scores_json)
+                history.append({
+                    "id": snap.id,
+                    "scores": snap_scores,
+                    "overallScore": round(sum(snap_scores.values()) / len(ABILITY_DIMENSIONS), 1),
+                    "triggerEvent": snap.trigger_event,
+                    "createdAt": snap.created_at.isoformat(),
+                })
+            response_data["history"] = history
+
+        return response_data
+
+    @app.get("/api/pets/pool")
+    def pets_pool(db: Session = Depends(get_db)) -> dict[str, object]:
+        pets = db.scalars(select(PetPool).where(PetPool.enabled.is_(True)).order_by(PetPool.id)).all()
+        return {
+            "pets": [
+                {
+                    "name": pet.pet_type,
+                    "category": pet.pet_category,
+                    "desc": pet.description,
+                }
+                for pet in pets
+            ]
+        }
+
+    @app.post("/api/pets/claim")
+    def claim_pet(payload: PetClaimRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        user = get_or_create_user(db, payload.ownerId)
+        pool_pet = db.scalar(select(PetPool).where(PetPool.pet_type == payload.petType, PetPool.enabled.is_(True)))
+        if not pool_pet:
+            raise HTTPException(status_code=404, detail="Pet type not found")
+        pet = get_pet(db, payload.ownerId)
+        if not pet:
+            next_id = int(db.scalar(select(func.count(Pet.id))) or 0) + 8294
+            pet = Pet(
+                pet_id=f"PET-{next_id}",
+                owner_id=payload.ownerId,
+                pet_type=pool_pet.pet_type,
+                pet_category=pool_pet.pet_category,
+                pet_name=payload.petName or None,
+                avatar_emoji=payload.avatarEmoji or None,
+                level=1,
+                stage="幼崽期",
+                growth_value=30,
+                last_training_at=datetime.utcnow(),
+            )
+            db.add(pet)
+        else:
+            # 已有宠物：若请求中携带昵称/头像，则同步更新
+            if payload.petName is not None:
+                pet.pet_name = payload.petName or None
+            if payload.avatarEmoji is not None:
+                pet.avatar_emoji = payload.avatarEmoji or None
+        user.has_pet = True
+        user.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(pet)
+        return {"pet": pet_to_response(pet), "currentUser": user_to_response(user)}
+
+    @app.patch("/api/pets/profile")
+    def update_pet_profile(payload: PetProfileUpdateRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """更新宠物的自定义昵称与头像 emoji。"""
+        pet = get_pet(db, payload.ownerId)
+        if not pet:
+            raise HTTPException(status_code=404, detail="Pet not found")
+        if payload.petName is not None:
+            trimmed = payload.petName.strip()
+            pet.pet_name = trimmed or None
+        if payload.avatarEmoji is not None:
+            trimmed_emoji = payload.avatarEmoji.strip()
+            pet.avatar_emoji = trimmed_emoji or None
+        db.commit()
+        db.refresh(pet)
+        return {"pet": pet_to_response(pet)}
+
+    @app.get("/api/pets/my")
+    def my_pet(ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)) -> dict[str, object]:
+        pet = get_pet(db, ownerId)
+        if not pet:
+            raise HTTPException(status_code=404, detail="Pet not found")
+        return {"pet": pet_to_response(pet)}
+
+    @app.get("/api/pets/stages")
+    def pet_stages() -> dict[str, object]:
+        return {
+            "stages": [
+                {"name": "幼崽期", "levelRange": "Lv.1-Lv.3", "appearance": "基础可爱形态"},
+                {"name": "学习期", "levelRange": "Lv.4-Lv.7", "appearance": "增加书包、徽章、提示牌等学习元素"},
+                {"name": "成长期", "levelRange": "Lv.8-Lv.12", "appearance": "增加护盾、警示灯、识别器等反诈元素"},
+                {"name": "进阶期", "levelRange": "Lv.13-Lv.16", "appearance": "增加更明显的守护装备"},
+                {"name": "反诈守护者", "levelRange": "Lv.17-Lv.20", "appearance": "完整守护形态"},
+            ]
+        }
+
+    @app.get("/api/training/tasks")
+    def training_tasks(db: Session = Depends(get_db)) -> dict[str, object]:
+        tasks = db.scalars(select(TrainingTask).where(TrainingTask.enabled.is_(True)).order_by(TrainingTask.id)).all()
+        return {"tasks": [task_to_response(task) for task in tasks]}
+
+    @app.get("/api/training/tasks/{task_id}")
+    def training_task(task_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+        task = db.get(TrainingTask, task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Training task not found")
+        questions = db.scalars(select(TrainingQuestion).where(TrainingQuestion.task_id == task_id).order_by(TrainingQuestion.id)).all()
+        return {
+            "task": task_to_response(task),
+            "scenario": scenario_response(task_id, task.fraud_type),
+            "questions": [
+                {
+                    "id": question.id,
+                    "questionType": question.question_type,
+                    "stem": question.stem,
+                    "options": json.loads(question.options_json),
+                    "correctAnswer": json.loads(question.correct_answer_json),
+                    "explanation": question.explanation,
+                }
+                for question in questions
+            ],
+        }
+
+    @app.post("/api/training/submit")
+    def submit_training(payload: TrainingSubmitRequest, request: Request, db: Session = Depends(get_db)) -> dict[str, object]:
+        # 软绑定身份：携带合法 Bearer Token 时以 Token 对应 owner 为准，防止伪造 ownerId（A18）
+        owner_id = resolve_owner_id(request, db, payload.ownerId)
+        user = get_or_create_user(db, owner_id)
+        pet = get_pet(db, owner_id)
+        if not pet or not user.has_pet:
+            raise HTTPException(status_code=409, detail="Claim a pet before training")
+        task = db.get(TrainingTask, payload.taskId)
+        if not task:
+            raise HTTPException(status_code=404, detail="Training task not found")
+
+        accuracy = score_answers(db, payload.taskId, payload.answers)
+        score = round(accuracy * 100)
+        growth = training_growth(
+            task.max_reward,
+            task.difficulty,
+            accuracy,
+            get_rule_value(db, "taskMaxGrowth", TASK_MAX_GROWTH),
+        )
+        reward_status = "AWARDED"
+        reward_message = "本次训练已完成，成长值已发放"
+
+        # 并发安全：同一进程内多线程同时提交同一用户训练时，用进程内锁保证
+        # 「幂等校验 + 发奖 + 落库」原子执行，避免重复发奖（边界/健壮性 A14）
+        with _award_lock:
+            if awarded_training_today(db, owner_id, payload.taskId):
+                growth["finalGrowth"] = 0
+                reward_status = "NO_REWARD"
+                reward_message = "本次已完成学习，但重复完成同一任务不再增加成长值"
+            else:
+                remaining = max(0, get_rule_value(db, "dailyMaxGrowth", DAILY_MAX_GROWTH) - daily_awarded_growth(db, owner_id))
+                if remaining <= 0:
+                    growth["finalGrowth"] = 0
+                    reward_status = "NO_REWARD"
+                    reward_message = "本次已完成学习，但今日奖励已达上限，不再增加成长值"
+                elif growth["finalGrowth"] > remaining:
+                    growth["finalGrowth"] = remaining
+                    reward_message = "本次训练已完成，成长值按今日上限发放"
+
+            apply_growth(pet, growth["finalGrowth"])
+            record = TrainingRecord(
+                owner_id=owner_id,
+                pet_id=pet.pet_id,
+                task_id=payload.taskId,
+                mode=payload.mode,
+                score=score,
+                accuracy=accuracy,
+                difficulty=task.difficulty,
+                base_points=growth["basePoints"],
+                accuracy_bonus=growth["accuracyBonus"],
+                difficulty_bonus=growth["difficultyBonus"],
+                final_growth=growth["finalGrowth"],
+                reward_status=reward_status,
+                reward_message=reward_message,
+            )
+            db.add(record)
+            db.flush()  # 确保 record.created_at 可用
+            db.commit()  # 锁内提交，保证并发请求立即看到本次发奖，杜绝重复发奖
+            db.refresh(pet)
+
+        # 生成错题复训任务（P1-1：复训触发）—— 在锁外执行，避免长事务占用锁
+        from .retrain_scheduler import schedule_retrain
+
+        questions = db.scalars(select(TrainingQuestion).where(TrainingQuestion.task_id == payload.taskId)).all()
+        provided = {answer.questionId: normalize_answer(answer.answer) for answer in payload.answers}
+        wrong_items = []
+        for question in questions:
+            correct_answer = normalize_answer(json.loads(question.correct_answer_json))
+            if provided.get(question.id, set()) != correct_answer:
+                wrong_items.append({
+                    "questionId": question.id,
+                    "taskId": payload.taskId,
+                    "fraudType": task.fraud_type,
+                    "abilityDim": getattr(question, "ability_dim", "识诈力"),
+                })
+
+        if wrong_items:
+            retrain_tasks = schedule_retrain(wrong_items, record.created_at)
+            for rt in retrain_tasks:
+                existing = db.scalar(
+                    select(RetrainTask).where(
+                        RetrainTask.owner_id == owner_id,
+                        RetrainTask.original_question_id == rt["originalQuestionId"],
+                        RetrainTask.attempt == rt["attempt"],
+                    )
+                )
+                if not existing:
+                    retrain_task = RetrainTask(
+                        owner_id=owner_id,
+                        original_question_id=rt["originalQuestionId"],
+                        original_task_id=rt["originalTaskId"],
+                        fraud_type=rt["fraudType"],
+                        target_ability=rt["targetAbility"],
+                        attempt=rt["attempt"],
+                        scheduled_at=datetime.fromisoformat(rt["scheduledAt"]),
+                        status="pending",
+                        variant_strategy=rt["variantStrategy"],
+                    )
+                    db.add(retrain_task)
+            db.commit()  # 持久化复训任务
+
+        db.refresh(pet)
+
+        retrain_count = len(wrong_items) * 3 if wrong_items else 0
+        return {
+            "score": score,
+            "accuracy": accuracy,
+            "growth": growth,
+            "rewardStatus": reward_status,
+            "rewardMessage": reward_message,
+            "pet": pet_to_response(pet),
+            "retrainScheduled": retrain_count,
+        }
+
+    @app.post("/api/risk/analyze")
+    def risk_analyze(payload: RiskAnalyzeRequest, request: Request, db: Session = Depends(get_db)) -> dict[str, object]:
+        # 软绑定身份：携带合法 Bearer Token 时以 Token 对应 owner 为准，防止伪造 ownerId（A18）
+        owner_id = resolve_owner_id(request, db, payload.ownerId)
+        result = analyze_text(payload.text)
+        pet = get_pet(db, owner_id)
+        # 并发安全：同一进程内多线程并发提交时，用锁保证「校验今日次数 + 发奖 + 落库」原子，避免重复发奖（A14）
+        with _award_lock:
+            checks_today = [
+                check
+                for check in db.scalars(
+                    select(SuspiciousCheck).where(
+                        SuspiciousCheck.owner_id == owner_id,
+                        SuspiciousCheck.reward_status == "AWARDED",
+                    )
+                ).all()
+                if same_day(check.created_at)
+            ]
+            growth_awarded = 10 if pet and len(checks_today) < get_rule_value(db, "suspiciousCheckDailyLimit", SUSPICIOUS_CHECK_DAILY_LIMIT) else 0
+            reward_status = "AWARDED" if growth_awarded else "NO_REWARD"
+            if pet:
+                apply_growth(pet, growth_awarded)
+            check = SuspiciousCheck(
+                owner_id=owner_id,
+                input_text_masked=mask_text(payload.text),
+                fraud_type=str(result["fraudType"]),
+                risk_score=int(result["riskScore"]),
+                risk_level=str(result["riskLevel"]),
+                evidence_json=json.dumps(result["evidence"], ensure_ascii=False),
+                suggestions_json=json.dumps(result["suggestions"], ensure_ascii=False),
+                growth_awarded=growth_awarded,
+                reward_status=reward_status,
+            )
+            db.add(check)
+            db.commit()
+        response = dict(result)
+        response.update({"growthAwarded": growth_awarded, "rewardStatus": reward_status})
+        return response
+
+    @app.get("/api/ranking")
+    def ranking(type: str = Query("total"), ownerId: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
+        pets = db.scalars(
+            select(Pet).order_by(Pet.growth_value.desc(), Pet.level.desc(), Pet.last_training_at.desc())
+        ).all()
+        rows = [
+            {
+                "rank": idx + 1,
+                "petId": pet.pet_id,
+                "ownerId": pet.owner_id,
+                "petType": pet.pet_type,
+                "level": pet.level,
+                "growthValue": pet.growth_value,
+                "lastTrainingAt": pet.last_training_at.strftime("%Y-%m-%d %H:%M") if pet.last_training_at else "",
+            }
+            for idx, pet in enumerate(pets)
+        ]
+        target_owner = ownerId or "U-2408**"
+        my_rank = next((row for row in rows if row["ownerId"] == target_owner), None)
+        if my_rank:
+            previous = next((row for row in rows if row["rank"] == my_rank["rank"] - 1), None)
+            my_rank = {
+                **my_rank,
+                "distanceToPrevious": max(0, int(previous["growthValue"]) - int(my_rank["growthValue"])) if previous else 0,
+            }
+        return {
+            "type": type,
+            "myRank": my_rank,
+            "list": rows,
+            "sortRule": ["growth_value DESC", "level DESC", "last_training_at DESC"],
+            "privacyNotice": "不展示真实姓名、手机号、学号、身份证号和负面评价标签。",
+        }
+
+    @app.get("/api/knowledge/categories")
+    def knowledge_categories(db: Session = Depends(get_db)) -> dict[str, object]:
+        categories = db.scalars(select(KnowledgeItem.category).distinct().order_by(KnowledgeItem.category)).all()
+        return {"categories": categories}
+
+    @app.get("/api/knowledge/items")
+    def knowledge_items(category: str | None = None, db: Session = Depends(get_db)) -> dict[str, object]:
+        query = select(KnowledgeItem)
+        if category:
+            query = query.where(KnowledgeItem.category == category)
+        items = db.scalars(query.order_by(KnowledgeItem.id)).all()
+        return {
+            "items": [
+                {
+                    "id": item.id,
+                    "category": item.category,
+                    "title": item.title,
+                    "riskLevel": item.risk_level,
+                    "typicalPhrase": item.typical_phrase,
+                    "recognitionPoints": item.recognition_points,
+                    "suggestions": item.suggestions,
+                    "relatedTaskId": item.related_task_id,
+                }
+                for item in items
+            ]
+        }
+
+    @app.post("/api/knowledge/analyze-image")
+    async def knowledge_analyze_image(image: UploadFile = File(...)) -> dict[str, object]:
+        """上传聊天截图，返回模拟 OCR 文本与诈骗类型识别结果。
+
+        当前为 Demo 模拟识别：不依赖真实 OCR 引擎，基于文件哈希从预置样本库
+        中抽取模拟文本并做关键词匹配。生产环境可替换为真实 OCR + LLM。
+        """
+        try:
+            # 先按声明体积快速拦截，再分块读取并硬性封顶，避免超大文件占满内存（性能/健壮性 R2）
+            max_bytes = 10 * 1024 * 1024
+            if image.size is not None and image.size > max_bytes:
+                return {
+                    "success": False,
+                    "error": "图片过大，请压缩后在 10MB 以内重试",
+                    "filename": image.filename or "screenshot.png",
+                }
+            file_bytes = await image.read(max_bytes + 1)
+            if len(file_bytes) > max_bytes:
+                return {
+                    "success": False,
+                    "error": "图片过大，请压缩后在 10MB 以内重试",
+                    "filename": image.filename or "screenshot.png",
+                }
+            result = analyze_image(file_bytes, image.filename or "screenshot.png")
+            return result
+        except Exception:
+            logger.exception("图片分析失败")
+            return {
+                "success": False,
+                "error": "图片分析失败，请稍后重试或检查图片格式",
+                "filename": image.filename or "screenshot.png",
+            }
+
+    @app.get("/api/records")
+    def records(ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)) -> dict[str, object]:
+        training_records = db.scalars(select(TrainingRecord).where(TrainingRecord.owner_id == ownerId).order_by(TrainingRecord.created_at.desc())).all()
+        checks = db.scalars(select(SuspiciousCheck).where(SuspiciousCheck.owner_id == ownerId).order_by(SuspiciousCheck.created_at.desc())).all()
+        return {
+            "trainingRecords": [
+                {
+                    "taskId": record.task_id,
+                    "score": record.score,
+                    "accuracy": record.accuracy,
+                    "finalGrowth": record.final_growth,
+                    "rewardStatus": record.reward_status,
+                    "rewardMessage": record.reward_message,
+                    "createdAt": record.created_at.isoformat(),
+                }
+                for record in training_records
+            ],
+            "suspiciousChecks": [
+                {
+                    "riskLevel": check.risk_level,
+                    "riskScore": check.risk_score,
+                    "growthAwarded": check.growth_awarded,
+                    "rewardStatus": check.reward_status,
+                    "createdAt": check.created_at.isoformat(),
+                }
+                for check in checks
+            ],
+        }
+
+    @app.get("/api/admin/cases")
+    def admin_cases(db: Session = Depends(get_db), admin_auth: None = Depends(require_admin_key)) -> dict[str, object]:
+        cases = db.scalars(select(FraudCase).order_by(FraudCase.created_at.desc())).all()
+        return {
+            "cases": [
+                {
+                    "id": case.id,
+                    "title": case.title,
+                    "fraudType": case.fraud_type,
+                    "sourceChannel": case.source_channel,
+                    "riskLevel": case.risk_level,
+                    "aiConfidence": case.ai_confidence,
+                    "desensitized": case.desensitized,
+                    "status": case.status,
+                    "summary": case.summary,
+                    "riskTags": json.loads(case.risk_tags_json),
+                }
+                for case in cases
+            ]
+        }
+
+    @app.post("/api/admin/cases")
+    def admin_create_case(payload: CaseCreateRequest, db: Session = Depends(get_db), admin_auth: None = Depends(require_admin_key)) -> dict[str, object]:
+        case_id = f"case-{int(datetime.utcnow().timestamp())}"
+        risk = analyze_text(f"{payload.title} {payload.summary}")
+        case = FraudCase(
+            id=case_id,
+            title=payload.title,
+            fraud_type=payload.fraudType,
+            source_channel=payload.sourceChannel,
+            risk_level=payload.riskLevel,
+            ai_confidence=0.75,
+            desensitized=True,
+            status="待解析",
+            summary=payload.summary,
+            risk_tags_json=json.dumps(risk["evidence"], ensure_ascii=False),
+        )
+        db.add(case)
+        db.commit()
+        return {"caseId": case.id, "status": case.status}
+
+    @app.post("/api/admin/cases/{case_id}/analyze")
+    def admin_analyze_case(case_id: str, db: Session = Depends(get_db), admin_auth: None = Depends(require_admin_key)) -> dict[str, object]:
+        case = db.get(FraudCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail="Case not found")
+        risk = analyze_text(f"{case.title} {case.summary}")
+        case.status = "已解析"
+        case.risk_level = str(risk["riskLevel"])
+        case.fraud_type = str(risk["fraudType"])
+        case.risk_tags_json = json.dumps(risk["evidence"], ensure_ascii=False)
+        db.commit()
+        return {"caseId": case.id, "riskElements": risk["evidence"], "recommendedQuestionTypes": ["单选题", "多选题", "情景判断"]}
+
+    @app.post("/api/admin/cases/{case_id}/generate-questions")
+    def admin_generate_questions(case_id: str, db: Session = Depends(get_db), admin_auth: None = Depends(require_admin_key)) -> dict[str, object]:
+        case = db.get(FraudCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail="Case not found")
+        case.status = "已生成训练题"
+        db.commit()
+        return {
+            "caseId": case.id,
+            "questions": [
+                {
+                    "stem": "本案例中最需要警惕的风险信号是什么？",
+                    "options": ["A. 要求转账", "B. 拒绝核验", "C. 制造紧急压力", "D. 以上都是"],
+                    "correctAnswer": "D",
+                }
+            ],
+        }
+
+    @app.get("/api/admin/rules")
+    def admin_rules(db: Session = Depends(get_db), admin_auth: None = Depends(require_admin_key)) -> dict[str, object]:
+        rules = db.scalars(select(GrowthRule).order_by(GrowthRule.rule_key)).all()
+        return {
+            "rules": {rule.rule_key: rule.rule_value for rule in rules},
+            "complianceNotice": COMPLIANCE_NOTICE,
+        }
+
+    @app.put("/api/admin/rules")
+    def admin_save_rules(payload: dict[str, Any], db: Session = Depends(get_db), admin_auth: None = Depends(require_admin_key)) -> dict[str, object]:
+        invalid: list[str] = []
+        for key, value in payload.items():
+            # 数值型规则做边界校验，避免脏数据导致后续 int() 解析失败
+            if key in _NUMERIC_RULE_KEYS:
+                try:
+                    int(str(value))
+                except (ValueError, TypeError):
+                    invalid.append(key)
+                    continue
+            rule = db.scalar(select(GrowthRule).where(GrowthRule.rule_key == key))
+            if rule:
+                rule.rule_value = str(value)
+            else:
+                db.add(GrowthRule(rule_key=key, rule_value=str(value), description="管理端新增规则"))
+        db.commit()
+        return {"saved": True, "invalid": invalid}
+
+    # ==================== 整改新增 API ====================
+
+    # ---------- Dashboard Summary ----------
+    @app.get("/api/dashboard/summary")
+    def dashboard_summary(ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)) -> dict[str, object]:
+        """首页聚合接口：当前能力、薄弱类型、任务进度、最近变化"""
+        user = get_or_create_user(db, ownerId)
+        pet = get_pet(db, ownerId)
+
+        # 最近一次测评画像
+        latest_assessment = db.scalar(
+            select(AssessmentResult)
+            .where(AssessmentResult.owner_id == ownerId)
+            .order_by(AssessmentResult.created_at.desc())
+        )
+        profile = json.loads(latest_assessment.ability_profile_json) if latest_assessment else None
+        weak_dims = json.loads(latest_assessment.weak_dimensions_json) if latest_assessment else []
+        overall_score = round(sum(profile.values()) / len(profile)) if profile else 0
+
+        # 当前任务包
+        current_package = db.scalar(
+            select(TaskPackage)
+            .where(TaskPackage.owner_id == ownerId, TaskPackage.status == "active")
+            .order_by(TaskPackage.created_at.desc())
+        )
+        package_progress = None
+        if current_package:
+            total_items = db.scalar(
+                select(func.count(TaskPackageItem.id))
+                .where(TaskPackageItem.package_id == current_package.id)
+            ) or 0
+            completed_items = db.scalar(
+                select(func.count(TaskPackageItem.id))
+                .where(TaskPackageItem.package_id == current_package.id, TaskPackageItem.status == "completed")
+            ) or 0
+            package_progress = {
+                "id": current_package.id,
+                "planType": current_package.plan_type,
+                "totalItems": total_items,
+                "completedItems": completed_items,
+                "progressPercent": round(completed_items / max(total_items, 1) * 100),
+            }
+
+        # 最近能力变化（与上上次测评对比）
+        previous_assessment = db.scalar(
+            select(AssessmentResult)
+            .where(AssessmentResult.owner_id == ownerId)
+            .order_by(AssessmentResult.created_at.desc())
+            .offset(1)
+            .limit(1)
+        )
+        ability_change = None
+        if latest_assessment and previous_assessment:
+            from .ability_profile import ability_delta
+            before = {"scores": json.loads(previous_assessment.ability_profile_json)}
+            after = {"scores": json.loads(latest_assessment.ability_profile_json)}
+            ability_change = ability_delta(before, after)
+
+        # 到期的复训任务
+        from .retrain_scheduler import get_due_retrains, schedule_retrain
+        pending_retrains = db.scalars(
+            select(RetrainTask)
+            .where(RetrainTask.owner_id == ownerId, RetrainTask.status == "pending")
+            .order_by(RetrainTask.scheduled_at)
+        ).all()
+        due_retrains = [rt for rt in pending_retrains if rt.scheduled_at <= datetime.utcnow()]
+
+        # 最近的训练记录数
+        recent_training_count = db.scalar(
+            select(func.count(TrainingRecord.id))
+            .where(TrainingRecord.owner_id == ownerId)
+        ) or 0
+
+        return {
+            "ownerId": ownerId,
+            "hasCompletedAssessment": user.has_completed_assessment,
+            "hasPet": user.has_pet,
+            "abilityProfile": profile,
+            "overallScore": overall_score,
+            "weakDimensions": weak_dims,
+            "packageProgress": package_progress,
+            "abilityChange": ability_change,
+            "dueRetrainCount": len(due_retrains),
+            "recentTrainingCount": recent_training_count,
+            "pet": pet_to_response(pet) if pet else None,
+        }
+
+    # ---------- Ability Profile ----------
+    @app.get("/api/assessment/ability-profile")
+    def get_ability_profile(ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)) -> dict[str, object]:
+        """获取用户的五维能力画像"""
+        latest = db.scalar(
+            select(AssessmentResult)
+            .where(AssessmentResult.owner_id == ownerId)
+            .order_by(AssessmentResult.created_at.desc())
+        )
+        if not latest:
+            return {"profile": None, "message": "尚未完成测评"}
+        from .ability_profile import ABILITY_DIMENSIONS, DIMENSION_DESCRIPTIONS, DIMENSION_SUGGESTIONS
+        scores = json.loads(latest.ability_profile_json)
+        weak = json.loads(latest.weak_dimensions_json)
+        return {
+            "profile": {
+                "scores": scores,
+                "weakDimensions": weak,
+                "overallScore": round(sum(scores.values()) / len(ABILITY_DIMENSIONS)),
+                "descriptions": DIMENSION_DESCRIPTIONS,
+                "suggestions": DIMENSION_SUGGESTIONS,
+            },
+            "assessmentTime": latest.created_at.isoformat(),
+        }
+
+    # ---------- Task Package ----------
+    @app.post("/api/task-package/generate")
+    def generate_task_package(payload: TaskPackageGenerateRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """生成 AI 任务包（7天/14天训练计划）"""
+        from .ability_profile import compute_ability_profile
+        from .task_planner import generate_plan_rule
+
+        # 检查是否已有进行中的任务包
+        existing = db.scalar(
+            select(TaskPackage)
+            .where(TaskPackage.owner_id == payload.ownerId, TaskPackage.status == "active")
+        )
+        if existing:
+            return {"message": "已有进行中的任务包", "packageId": existing.id}
+
+        # 获取能力画像
+        latest = db.scalar(
+            select(AssessmentResult)
+            .where(AssessmentResult.owner_id == payload.ownerId)
+            .order_by(AssessmentResult.created_at.desc())
+        )
+        if not latest:
+            raise HTTPException(status_code=400, detail="请先完成测评")
+
+        profile = {
+            "scores": json.loads(latest.ability_profile_json),
+            "weakDimensions": json.loads(latest.weak_dimensions_json),
+        }
+
+        # 使用规则引擎生成计划（同步，不依赖 AI）
+        plan = generate_plan_rule(profile, payload.planType)
+        plan["source"] = "rule"
+        plan["motivationText"] = "坚持训练，每天进步一点点！"
+
+        # 保存任务包和条目
+        now = datetime.utcnow()
+        total_days = 7 if payload.planType == "7day" else 14
+        from datetime import timedelta
+        pkg = TaskPackage(
+            id=f"pkg-{now.strftime('%Y%m%d')}-{secrets.randbelow(9000)+1000}",
+            owner_id=payload.ownerId,
+            plan_type=payload.planType,
+            status="active",
+            ability_profile_json=json.dumps(profile["scores"], ensure_ascii=False),
+            generated_by=plan.get("source", "rule"),
+            total_items=len(plan.get("items", [])),
+            completed_items=0,
+            created_at=now,
+            expires_at=now + timedelta(days=total_days),
+        )
+        db.add(pkg)
+        db.flush()
+
+        for item in plan.get("items", []):
+            pkg_item = TaskPackageItem(
+                id=item["id"],
+                package_id=pkg.id,
+                owner_id=payload.ownerId,
+                day_index=item["dayIndex"],
+                task_type=item["taskType"],
+                task_ref=item["taskRef"],
+                task_title=item["taskTitle"],
+                target_ability=item.get("targetAbility", "识诈力"),
+                estimated_minutes=item.get("estimatedMinutes", 15),
+                status="pending",
+            )
+            db.add(pkg_item)
+
+        db.commit()
+
+        return {
+            "packageId": pkg.id,
+            "planType": pkg.plan_type,
+            "motivationText": plan.get("motivationText", ""),
+            "totalDays": total_days,
+            "items": plan.get("items", []),
+            "weakDimensionSuggestions": plan.get("weakDimensionSuggestions", []),
+            "source": plan.get("source", "rule"),
+        }
+
+    # ── v1 任务包 API（Phase 1.4：个性化任务包，含富元数据）─────────────────
+    @app.post("/api/v1/task-package/generate")
+    def v1_generate_task_package(
+        payload: TaskPackageGenerateRequest, db: Session = Depends(get_db)
+    ) -> dict[str, object]:
+        """生成个性化任务包（v1）。
+
+        根据五维能力画像生成 7 天或 14 天训练计划。
+        - 完全由规则引擎驱动（薄弱维度 → 对应训练）
+        - 每项任务含目标、完成标准、验收方式
+        - AI 仅在可用时填充激励文案
+        """
+        from .task_planner import generate_plan_rule
+
+        # 检查是否已有进行中的任务包
+        existing = db.scalar(
+            select(TaskPackage)
+            .where(TaskPackage.owner_id == payload.ownerId, TaskPackage.status == "active")
+        )
+        if existing:
+            items = (
+                db.query(TaskPackageItem)
+                .filter(TaskPackageItem.package_id == existing.id)
+                .order_by(TaskPackageItem.day_index)
+                .all()
+            )
+            return {
+                "packageId": existing.id,
+                "planType": existing.plan_type,
+                "status": existing.status,
+                "message": "已有进行中的任务包",
+                "items": [
+                    {
+                        "id": it.id,
+                        "dayIndex": it.day_index,
+                        "taskType": it.task_type,
+                        "taskRef": it.task_ref,
+                        "taskTitle": it.task_title,
+                        "targetAbility": it.target_ability,
+                        "estimatedMinutes": it.estimated_minutes,
+                        "status": it.status,
+                    }
+                    for it in items
+                ],
+            }
+
+        # 获取最新能力画像
+        latest = db.scalar(
+            select(AssessmentResult)
+            .where(AssessmentResult.owner_id == payload.ownerId)
+            .order_by(AssessmentResult.created_at.desc())
+        )
+        if not latest:
+            raise HTTPException(status_code=400, detail="请先完成测评，生成能力画像后再创建任务包")
+
+        profile = {
+            "scores": json.loads(latest.ability_profile_json),
+            "weakDimensions": json.loads(latest.weak_dimensions_json),
+        }
+
+        # 规则引擎生成计划
+        plan = generate_plan_rule(profile, payload.planType)
+
+        # 保存到 TaskPackage + TaskPackageItem（复用现有表结构）
+        now = datetime.utcnow()
+        total_days = 7 if payload.planType == "7day" else 14
+        from datetime import timedelta
+
+        pkg = TaskPackage(
+            id=f"pkg-{now.strftime('%Y%m%d')}-{secrets.randbelow(9000)+1000}",
+            owner_id=payload.ownerId,
+            plan_type=payload.planType,
+            status="active",
+            ability_profile_json=json.dumps(profile["scores"], ensure_ascii=False),
+            generated_by="rule",
+            total_items=len(plan.get("items", [])),
+            completed_items=0,
+            created_at=now,
+            expires_at=now + timedelta(days=total_days),
+        )
+        db.add(pkg)
+        db.flush()
+
+        v1_items: list[dict[str, object]] = []
+        for item in plan.get("items", []):
+            pkg_item = TaskPackageItem(
+                id=item["id"],
+                package_id=pkg.id,
+                owner_id=payload.ownerId,
+                day_index=item["dayIndex"],
+                task_type=item["taskType"],
+                task_ref=item["taskRef"],
+                task_title=item["taskTitle"],
+                target_ability=item.get("targetAbility", "识诈力"),
+                estimated_minutes=item.get("estimatedMinutes", 15),
+                status="pending",
+            )
+            db.add(pkg_item)
+            v1_items.append({
+                "id": item["id"],
+                "dayIndex": item["dayIndex"],
+                "taskType": item["taskType"],
+                "taskRef": item["taskRef"],
+                "taskTitle": item["taskTitle"],
+                "targetAbility": item.get("targetAbility", "识诈力"),
+                "estimatedMinutes": item.get("estimatedMinutes", 15),
+                "objective": item.get("objective", ""),
+                "completionCriteria": item.get("completionCriteria", ""),
+                "acceptanceMethod": item.get("acceptanceMethod", ""),
+                "retrainCondition": item.get("retrainCondition", "正确率 < 60% 触发复训"),
+                "status": "pending",
+            })
+
+        db.commit()
+
+        return {
+            "packageId": pkg.id,
+            "planType": pkg.plan_type,
+            "status": pkg.status,
+            "totalDays": total_days,
+            "totalItems": len(v1_items),
+            "items": v1_items,
+            "weakDimensionSuggestions": plan.get("weakDimensionSuggestions", []),
+            "motivationText": "坚持训练，每天进步一点点！",
+            "createdAt": now.isoformat(),
+            "expiresAt": pkg.expires_at.isoformat(),
+        }
+
+    @app.get("/api/v1/task-package/current")
+    def v1_current_task_package(
+        ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)
+    ) -> dict[str, object]:
+        """获取当前进行中的 v1 任务包（含进度）。"""
+        pkg = db.scalar(
+            select(TaskPackage)
+            .where(TaskPackage.owner_id == ownerId, TaskPackage.status == "active")
+            .order_by(TaskPackage.created_at.desc())
+        )
+        if not pkg:
+            return {"taskPackage": None, "hasActivePackage": False}
+
+        items = (
+            db.query(TaskPackageItem)
+            .filter(TaskPackageItem.package_id == pkg.id)
+            .order_by(TaskPackageItem.day_index)
+            .all()
+        )
+
+        return {
+            "taskPackage": {
+                "packageId": pkg.id,
+                "planType": pkg.plan_type,
+                "status": pkg.status,
+                "totalItems": pkg.total_items,
+                "completedItems": pkg.completed_items,
+                "progress": round(pkg.completed_items / pkg.total_items * 100, 1) if pkg.total_items > 0 else 0,
+                "createdAt": pkg.created_at.isoformat(),
+                "expiresAt": pkg.expires_at.isoformat(),
+                "items": [
+                    {
+                        "id": it.id,
+                        "dayIndex": it.day_index,
+                        "taskType": it.task_type,
+                        "taskRef": it.task_ref,
+                        "taskTitle": it.task_title,
+                        "targetAbility": it.target_ability,
+                        "estimatedMinutes": it.estimated_minutes,
+                        "status": it.status,
+                        "score": it.score,
+                        "completedAt": it.completed_at.isoformat() if it.completed_at else None,
+                    }
+                    for it in items
+                ],
+            },
+            "hasActivePackage": True,
+        }
+
+    @app.get("/api/task-package/current")
+    def current_task_package(ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)) -> dict[str, object]:
+        """获取当前进行中的任务包"""
+        pkg = db.scalar(
+            select(TaskPackage)
+            .where(TaskPackage.owner_id == ownerId, TaskPackage.status == "active")
+            .order_by(TaskPackage.created_at.desc())
+        )
+        if not pkg:
+            return {"package": None, "message": "暂无进行中的任务包"}
+
+        items = db.scalars(
+            select(TaskPackageItem)
+            .where(TaskPackageItem.package_id == pkg.id)
+            .order_by(TaskPackageItem.day_index)
+        ).all()
+
+        return {
+            "package": {
+                "id": pkg.id,
+                "planType": pkg.plan_type,
+                "status": pkg.status,
+                "totalItems": pkg.total_items,
+                "completedItems": pkg.completed_items,
+                "createdAt": pkg.created_at.isoformat(),
+                "expiresAt": pkg.expires_at.isoformat(),
+            },
+            "items": [
+                {
+                    "id": item.id,
+                    "dayIndex": item.day_index,
+                    "taskType": item.task_type,
+                    "taskRef": item.task_ref,
+                    "taskTitle": item.task_title,
+                    "targetAbility": item.target_ability,
+                    "estimatedMinutes": item.estimated_minutes,
+                    "status": item.status,
+                    "completedAt": item.completed_at.isoformat() if item.completed_at else None,
+                }
+                for item in items
+            ],
+        }
+
+    @app.post("/api/task-package/items/{item_id}/complete")
+    def complete_task_package_item(item_id: str, payload: TaskPackageItemCompleteRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """标记任务包条目完成"""
+        item = db.get(TaskPackageItem, item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Task item not found")
+
+        item.status = "completed"
+        item.completed_at = datetime.utcnow()
+        item.score = payload.score
+
+        # 更新任务包进度
+        pkg = db.get(TaskPackage, item.package_id)
+        if pkg:
+            pkg.completed_items = db.scalar(
+                select(func.count(TaskPackageItem.id))
+                .where(TaskPackageItem.package_id == pkg.id, TaskPackageItem.status == "completed")
+            ) or 0
+            if pkg.completed_items >= pkg.total_items:
+                pkg.status = "completed"
+
+        db.commit()
+
+        return {"item": {"id": item.id, "status": item.status, "completedAt": item.completed_at.isoformat()}}
+
+    # ---------- Scenario Training (AI Dialogue) ----------
+    @app.post("/api/training/scenario/start")
+    def start_scenario(payload: ScenarioStartRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """开始一场 AI 情景对话训练"""
+        from .scenario_state_machine import SCENARIO_FSM, get_state_prompt, get_fallback_reply, get_all_evidence
+
+        task = db.get(TrainingTask, payload.taskId)
+        if not task:
+            raise HTTPException(status_code=404, detail="Training task not found")
+
+        # 找到匹配的状态机类型
+        fraud_type = task.fraud_type
+        scenario_type = None
+        for st in SCENARIO_FSM:
+            if fraud_type in st or st in fraud_type:
+                scenario_type = st
+                break
+        if not scenario_type:
+            scenario_type = "刷单返利"  # 默认
+
+        session_id = f"scn-{secrets.token_hex(8)}"
+
+        # 初始消息：骗子开场白
+        initial_state = "S0"
+        fallback = get_fallback_reply(scenario_type, initial_state)
+
+        # 创建会话
+        now = datetime.utcnow()
+        initial_messages = [
+            {"role": "system", "content": f"情景训练开始：{scenario_type}", "state": initial_state, "timestamp": now.isoformat()},
+            {"role": "scammer", "content": fallback, "state": initial_state, "timestamp": now.isoformat()},
+        ]
+
+        session = ScenarioTrainingSession(
+            id=session_id,
+            owner_id=payload.ownerId,
+            task_id=payload.taskId,
+            fraud_type=scenario_type,
+            current_state=initial_state,
+            messages_json=json.dumps(initial_messages, ensure_ascii=False),
+            identified_evidence_json="[]",
+            user_behaviors_json="[]",
+            ai_enabled=is_llm_available(),  # 自动检测 LLM 可用性
+            started_at=now,
+        )
+        db.add(session)
+        db.commit()
+
+        return {
+            "sessionId": session_id,
+            "scenarioType": scenario_type,
+            "currentState": initial_state,
+            "stateName": get_state_prompt(scenario_type, initial_state),
+            "initialMessage": fallback,
+            "allEvidence": get_all_evidence(scenario_type),
+        }
+
+    @app.post("/api/training/scenario/{session_id}/reply")
+    async def scenario_reply(session_id: str, payload: ScenarioReplyRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """用户回复一轮 — 推进状态机，返回骗子回复（LLM 增强 or 规则降级）。"""
+        from .scenario_state_machine import (
+            classify_user_behavior,
+            transition,
+            get_state_prompt,
+            get_state_name,
+            get_fallback_reply,
+            get_all_evidence,
+        )
+
+        session = db.get(ScenarioTrainingSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session.status != "active":
+            raise HTTPException(status_code=400, detail="Session is not active")
+
+        # 分类用户行为
+        behavior = classify_user_behavior(payload.message)
+
+        # 推进状态机
+        result = transition(session.fraud_type, session.current_state, behavior)
+        new_state = result["newState"]
+        new_evidence = result["evidence"]
+        is_terminal = result["isTerminal"]
+
+        # 更新已识别证据
+        identified = json.loads(session.identified_evidence_json)
+        for ev in new_evidence:
+            if ev not in identified:
+                identified.append(ev)
+
+        # 更新用户行为记录
+        behaviors = json.loads(session.user_behaviors_json)
+        behaviors.append({
+            "message": payload.message[:100],
+            "behavior": behavior,
+            "state": session.current_state,
+        })
+
+        # 生成骗子回复 — 优先尝试 LLM，失败时降级到规则
+        scammer_reply = get_fallback_reply(session.fraud_type, new_state, behavior, payload.message)
+        reply_source = "rule"
+
+        if session.ai_enabled and not is_terminal:
+            # 构建对话历史供 AI 参考
+            state_prompt = get_state_prompt(session.fraud_type, new_state)
+            conversation_history = json.loads(session.messages_json)
+            messages_for_ai = [
+                {"role": m["role"], "content": m.get("content", "")}
+                for m in conversation_history[-6:]  # 最近6轮
+            ]
+            try:
+                ai_result = await AIService.dialogue(
+                    db,
+                    scenario_type=session.fraud_type,
+                    current_state=new_state,
+                    state_prompt=state_prompt,
+                    user_message=payload.message,
+                    conversation_history=messages_for_ai,
+                )
+                if ai_result and ai_result.get("reply"):
+                    scammer_reply = ai_result["reply"]
+                    reply_source = ai_result.get("source", "ai")
+            except Exception:
+                logger.exception("scenario_reply: AI dialogue failed, falling back to rule engine")
+
+        # 更新消息列表
+        messages = json.loads(session.messages_json)
+        now = datetime.utcnow()
+        messages.append({"role": "user", "content": payload.message, "behavior": behavior, "timestamp": now.isoformat()})
+        if not is_terminal:
+            messages.append({"role": "scammer", "content": scammer_reply, "source": reply_source, "state": new_state, "timestamp": now.isoformat()})
+            # 反诈守护者提示
+            messages.append({"role": "guardian", "content": "【反诈守护者提示】请思考对方话术中的风险信号，及时识别并拒绝。", "timestamp": now.isoformat()})
+        else:
+            messages.append({"role": "system", "content": "恭喜！你成功识破了诈骗骗局！", "timestamp": now.isoformat()})
+
+        # 更新会话
+        session.current_state = new_state
+        session.messages_json = json.dumps(messages, ensure_ascii=False)
+        session.identified_evidence_json = json.dumps(identified, ensure_ascii=False)
+        session.user_behaviors_json = json.dumps(behaviors, ensure_ascii=False)
+
+        if is_terminal or new_state in ("S4", "S5"):
+            session.status = "completed"
+            session.completed_at = now
+
+        db.commit()
+
+        return {
+            "sessionId": session_id,
+            "behavior": behavior,
+            "newState": new_state,
+            "stateName": get_state_name(session.fraud_type, new_state),
+            "scammerReply": scammer_reply if not is_terminal else "（对话已结束）",
+            "replySource": reply_source,
+            "identifiedEvidence": identified,
+            "newEvidence": new_evidence,
+            "isTerminal": is_terminal,
+            "isCompleted": session.status == "completed",
+        }
+
+    @app.post("/api/training/scenario/{session_id}/finish")
+    async def scenario_finish(session_id: str, payload: ScenarioFinishRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """结束对话训练 — 生成复盘报告（AI 增强 or 规则降级）。"""
+        from .review_engine import generate_review_rule
+        from .retrain_scheduler import schedule_retrain
+
+        session = db.get(ScenarioTrainingSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # 强制结束
+        session.status = "completed"
+        session.completed_at = datetime.utcnow()
+        db.commit()
+
+        # 生成复盘报告 — 优先 AI
+        session_data = {
+            "fraudType": session.fraud_type,
+            "scenarioType": session.fraud_type,
+            "finalState": session.current_state,
+            "identifiedEvidence": json.loads(session.identified_evidence_json),
+            "userBehaviors": json.loads(session.user_behaviors_json),
+            "messages": json.loads(session.messages_json),
+        }
+
+        review = None
+        if session.ai_enabled:
+            try:
+                review = await AIService.generate_review(db, session_data=session_data)
+            except Exception:
+                logger.exception("scenario_review: AI review generation failed, falling back to rule engine")
+
+        if not review:
+            review = generate_review_rule(session_data)
+
+        # 生成错题复训任务 — 情景训练结束也触发复训
+        missed_evidence = review.get("missedEvidence", [])
+        if missed_evidence:
+            wrong_items = [{
+                "questionId": f"scn-{session.id}",
+                "taskId": session.task_id or "",
+                "fraudType": session.fraud_type,
+                "abilityDim": "识诈力",
+            }]
+            retrain_tasks = schedule_retrain(wrong_items, datetime.utcnow())
+            for rt in retrain_tasks:
+                retrain_task = RetrainTask(
+                    owner_id=session.owner_id,
+                    original_question_id=rt["originalQuestionId"],
+                    original_task_id=rt["originalTaskId"],
+                    fraud_type=rt["fraudType"],
+                    target_ability=rt["targetAbility"],
+                    attempt=rt["attempt"],
+                    scheduled_at=datetime.fromisoformat(rt["scheduledAt"]),
+                    status="pending",
+                    variant_strategy=rt["variantStrategy"],
+                )
+                db.add(retrain_task)
+            db.commit()
+
+        return {
+            "sessionId": session_id,
+            "review": review,
+        }
+
+    # ---------- Risk Analysis AI Enhancement ----------
+    @app.post("/api/risk/analyze-ai")
+    def risk_analyze_ai(payload: RiskAnalyzeRequest, db: Session = Depends(get_db)) -> dict[str, object]:
+        """AI 增强风险分析（规则引擎 + LLM 语义理解）"""
+        # 使用规则引擎（同步，不依赖 AI）
+        result = analyze_text(payload.text)
+        pet = get_pet(db, payload.ownerId)
+        growth_awarded = 10 if pet else 0
+
+        return {**result, "growthAwarded": growth_awarded, "source": "rule"}
+
+    # ---------- Emergency Stop Loss ----------
+    @app.get("/api/risk/emergency-stop-loss/types")
+    def emergency_stop_loss_types() -> dict[str, object]:
+        """获取所有可选的危险行为类型"""
+        from .emergency_stop_loss import get_all_risk_types
+        return {"riskTypes": get_all_risk_types()}
+
+    @app.post("/api/risk/emergency-stop-loss")
+    def emergency_stop_loss(payload: EmergencyStopLossRequest) -> dict[str, object]:
+        """根据危险行为生成止损清单"""
+        from .emergency_stop_loss import get_stop_loss_checklist
+        result = get_stop_loss_checklist(payload.selectedRisks)
+        return result
+
+    # ---------- Evidence Center ----------
+    @app.get("/api/evidence/overview")
+    def evidence_overview(db: Session = Depends(get_db)) -> dict[str, object]:
+        """赛事证据中心 — AI 调用概览统计"""
+        from .ai_logger import get_overview_stats
+        stats = get_overview_stats(db)
+        return {
+            **stats,
+            "promptVersions": {
+                "dialogue": "v1.0",
+                "risk_analysis": "v1.0",
+                "task_planning": "v1.0",
+                "review": "v1.0",
+            },
+            "modelInfo": {
+                "name": os.getenv("LLM_MODEL", "rule-engine"),
+                "baseUrl": os.getenv("LLM_BASE_URL", ""),
+                "available": bool(os.getenv("LLM_API_KEY") and os.getenv("LLM_BASE_URL")),
+            },
+        }
+
+    @app.get("/api/evidence/ai-logs")
+    def evidence_ai_logs(
+        limit: int = Query(default=20, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+        call_type: str | None = None,
+        db: Session = Depends(get_db),
+    ) -> dict[str, object]:
+        """赛事证据中心 — AI 调用记录列表"""
+        from .ai_logger import get_recent_logs, get_log_count
+        logs = get_recent_logs(db, limit=limit, offset=offset, call_type=call_type)
+        total = get_log_count(db, call_type=call_type)
+        return {"logs": logs, "total": total}
+
+    @app.get("/api/evidence/prompt-versions")
+    def evidence_prompt_versions() -> dict[str, object]:
+        """赛事证据中心 — Prompt 版本清单"""
+        return {
+            "versions": [
+                {"type": "dialogue", "version": "v1.0", "description": "情景对话 Prompt — 约束 AI 按状态机生成骗子回复"},
+                {"type": "risk_analysis", "version": "v1.0", "description": "风险分析 Prompt — LLM 语义理解风险信号"},
+                {"type": "task_planning", "version": "v1.0", "description": "任务规划 Prompt — 生成个性化训练激励文案"},
+                {"type": "review", "version": "v1.0", "description": "复盘 Prompt — 生成训练复盘总结"},
+            ]
+        }
+
+    # ---------- Retrain ----------
+    @app.get("/api/retrain/due")
+    def get_due_retrains(ownerId: str = Query("U-2408**"), db: Session = Depends(get_db)) -> dict[str, object]:
+        """获取到期的复训任务"""
+        pending = db.scalars(
+            select(RetrainTask)
+            .where(RetrainTask.owner_id == ownerId, RetrainTask.status == "pending")
+            .order_by(RetrainTask.scheduled_at)
+        ).all()
+        now = datetime.utcnow()
+        due = [
+            {
+                "id": rt.id,
+                "originalQuestionId": rt.original_question_id,
+                "originalTaskId": rt.original_task_id,
+                "fraudType": rt.fraud_type,
+                "targetAbility": rt.target_ability,
+                "attempt": rt.attempt,
+                "scheduledAt": rt.scheduled_at.isoformat(),
+                "variantStrategy": rt.variant_strategy,
+            }
+            for rt in pending if rt.scheduled_at <= now
+        ]
+        return {"retrains": due, "total": len(due)}
+
+    # ---------- Counselor Dashboard ----------
+    @app.get("/api/counselor/dashboard")
+    def counselor_dashboard(db: Session = Depends(get_db)) -> dict[str, object]:
+        """辅导员看板 — 匿名学生画像、班级汇总"""
+        # 所有学生数据汇总
+        students = db.scalars(select(User)).all()
+        total_students = len(students)
+        assessed = sum(1 for u in students if u.has_completed_assessment)
+        has_pets = sum(1 for u in students if u.has_pet)
+
+        # 能力画像汇总
+        all_assessments = db.scalars(
+            select(AssessmentResult).order_by(AssessmentResult.created_at.desc())
+        ).all()
+
+        # 按维度聚合
+        dim_avg: dict[str, list[float]] = {"识诈力": [], "判断力": [], "应对力": [], "证据力": [], "求助力": []}
+        all_weak: dict[str, int] = {}
+        owner_latest: dict[str, AssessmentResult] = {}
+        for a in all_assessments:
+            if a.owner_id not in owner_latest:
+                owner_latest[a.owner_id] = a
+        for a in owner_latest.values():
+            scores = json.loads(a.ability_profile_json)
+            for dim, val in scores.items():
+                if dim in dim_avg:
+                    dim_avg[dim].append(float(val))
+            for dim in json.loads(a.weak_dimensions_json):
+                all_weak[dim] = all_weak.get(dim, 0) + 1
+
+        avg_scores = {dim: round(sum(vals) / len(vals), 1) if vals else 0 for dim, vals in dim_avg.items()}
+
+        # 训练统计
+        total_training = db.scalar(select(func.count(TrainingRecord.id))) or 0
+        avg_accuracy = db.scalar(select(func.avg(TrainingRecord.accuracy))) or 0
+
+        # 诈骗类型分布（单次 GROUP BY，替代逐类型 COUNT 的 N+1）
+        fraud_rows = db.execute(
+            select(TrainingTask.fraud_type, func.count(TrainingRecord.id))
+            .join(TrainingTask, TrainingRecord.task_id == TrainingTask.id)
+            .group_by(TrainingTask.fraud_type)
+        ).all()
+        fraud_counts = {ft: int(c) for ft, c in fraud_rows if c}
+
+        # 学生匿名画像列表
+        owner_ids = list(owner_latest.keys())[:50]  # 最多50人
+        # 一次性取出这些学生的宠物，避免逐人查询（N+1 → 1 次 IN 查询）
+        pet_map: dict[str, object] = {}
+        if owner_ids:
+            pet_map = {
+                p.owner_id: p
+                for p in db.scalars(select(Pet).where(Pet.owner_id.in_(owner_ids))).all()
+            }
+        student_profiles = []
+        for owner_id in owner_ids:
+            a = owner_latest[owner_id]
+            pet = pet_map.get(owner_id)
+            student_profiles.append({
+                "ownerId": owner_id,
+                "overallScore": round(sum(json.loads(a.ability_profile_json).values()) / 5),
+                "weakDimensions": json.loads(a.weak_dimensions_json),
+                "accuracy": a.accuracy,
+                "petLevel": pet.level if pet else 0,
+                "lastAssessment": a.created_at.isoformat(),
+            })
+
+        # 训练趋势（最近7天）
+        from datetime import timedelta
+        training_trend = []
+        for i in range(7):
+            day = datetime.utcnow() - timedelta(days=6 - i)
+            day_start = day.replace(hour=0, minute=0, second=0)
+            day_end = day_start + timedelta(days=1)
+            count = db.scalar(
+                select(func.count(TrainingRecord.id))
+                .where(TrainingRecord.created_at >= day_start, TrainingRecord.created_at < day_end)
+            ) or 0
+            training_trend.append({
+                "date": day_start.strftime("%m-%d"),
+                "count": count,
+            })
+
+        return {
+            "overview": {
+                "totalStudents": total_students,
+                "assessedRate": round(assessed / max(total_students, 1) * 100),
+                "petRate": round(has_pets / max(total_students, 1) * 100),
+                "totalTraining": total_training,
+                "avgAccuracy": round(avg_accuracy * 100, 1) if avg_accuracy else 0,
+            },
+            "avgScores": avg_scores,
+            "weakDistribution": [{"dimension": k, "count": v} for k, v in sorted(all_weak.items(), key=lambda x: -x[1])[:5]],
+            "fraudDistribution": [{"type": k, "count": v} for k, v in sorted(fraud_counts.items(), key=lambda x: -x[1])[:8]],
+            "trainingTrend": training_trend,
+            "studentProfiles": student_profiles,
+        }
+
+    # ---------- Class Meeting Materials ----------
+    @app.get("/api/counselor/class-meeting")
+    def class_meeting_materials(db: Session = Depends(get_db)) -> dict[str, object]:
+        """班会素材生成 — 基于班级数据生成讨论话题和教育建议"""
+        # 获取高频薄弱维度
+        all_assessments = db.scalars(select(AssessmentResult).order_by(AssessmentResult.created_at.desc())).all()
+        owner_latest = {}
+        for a in all_assessments:
+            if a.owner_id not in owner_latest:
+                owner_latest[a.owner_id] = a
+
+        weak_counter: dict[str, int] = {}
+        for a in owner_latest.values():
+            for dim in json.loads(a.weak_dimensions_json):
+                weak_counter[dim] = weak_counter.get(dim, 0) + 1
+
+        top_weak = sorted(weak_counter.items(), key=lambda x: -x[1])[:3]
+
+        # 根据薄弱维度生成讨论问题
+        DISCUSSION_TEMPLATES = {
+            "识诈力": {
+                "topic": "识别诈骗信号",
+                "questions": [
+                    "当你收到一条自称'客服退款'的短信时，你会怎么辨别真伪？",
+                    "讨论：兼职刷单为什么是诈骗？你能识别出哪些危险信号？",
+                ],
+                "activity": "角色扮演：一人扮演骗子发布刷单兼职信息，其他人尝试识别风险点。",
+            },
+            "判断力": {
+                "topic": "理性判断与决策",
+                "questions": [
+                    "如果有人承诺'稳赚不赔、年化30%收益'，你该如何判断？",
+                    "讨论：为什么骗子喜欢利用'紧急'和'限时'来施压？",
+                ],
+                "activity": "案例分析：给出一段AI换脸视频借钱场景，讨论该如何核实与应对。",
+            },
+            "应对力": {
+                "topic": "正确应对策略",
+                "questions": [
+                    "被要求开启屏幕共享时，正确的做法是什么？为什么？",
+                    "讨论：收到验证码短信时，是否可以告诉任何人？为什么？",
+                ],
+                "activity": "情景模拟：收到'老师'在群里发收款码要求交费，分角色演练正确应对流程。",
+            },
+            "证据力": {
+                "topic": "证据保留与举证",
+                "questions": [
+                    "如果真的遇到诈骗，应该保留哪些证据？",
+                    "讨论：微信聊天记录和转账截图在报警时有什么作用？",
+                ],
+                "activity": "实战演练：模拟被骗后的证据收集流程，学会截图保存关键信息。",
+            },
+            "求助力": {
+                "topic": "求助渠道与止损",
+                "questions": [
+                    "你知道哪些反诈求助渠道？96110是什么电话？",
+                    "讨论：发现被骗后，第一件事应该做什么？时间有多重要？",
+                ],
+                "activity": "知识竞赛：反诈热线、报警流程、银行紧急止付相关知识抢答。",
+            },
+        }
+
+        topics = []
+        for dim, count in top_weak:
+            template = DISCUSSION_TEMPLATES.get(dim)
+            if template:
+                topics.append({"dimension": dim, "weakCount": count, **template})
+
+        # 辅导员建议
+        suggestions = [
+            "定期在班级群发送反诈知识科普，重点针对班级高频薄弱维度",
+            "组织反诈主题班会，每学期至少2次",
+            "关注近期高发诈骗类型，及时向学生预警",
+            "建立班级反诈联络员制度，发现可疑情况及时通知辅导员",
+            "提醒学生遇到可疑情况第一时间拨打96110核实",
+        ]
+
+        return {
+            "generatedAt": datetime.utcnow().isoformat(),
+            "classProfile": {
+                "totalAssessed": len(owner_latest),
+                "topWeakDimensions": [{"dimension": d, "count": c} for d, c in top_weak],
+            },
+            "topics": topics,
+            "suggestions": suggestions,
+        }
+
+    # ---------- v1 情景训练 (State Machine + Rule-based) ----------
+    @app.post("/api/v1/training/scenario/start")
+    def v1_start_scenario(payload: ScenarioStartV1Request, db: Session = Depends(get_db)) -> dict[str, object]:
+        """v1: 以 scenarioType 直接启动情景训练，无需 TrainingTask 查找。"""
+        from .scenario_state_machine import (
+            SCENARIO_FSM,
+            get_fallback_reply,
+            get_state_prompt,
+            get_all_evidence,
+        )
+
+        # 校验 scenario_type 是否支持
+        if payload.scenarioType not in SCENARIO_FSM:
+            valid = list(SCENARIO_FSM.keys())
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的情景类型：{payload.scenarioType}。支持的类型：{', '.join(valid)}",
+            )
+
+        session_id = f"scn-{secrets.token_hex(8)}"
+        initial_state = "S0"
+        fallback = get_fallback_reply(payload.scenarioType, initial_state)
+
+        now = datetime.utcnow()
+        initial_messages = [
+            {
+                "role": "system",
+                "content": f"情景训练开始：{payload.scenarioType}",
+                "state": initial_state,
+                "timestamp": now.isoformat(),
+            },
+            {
+                "role": "scammer",
+                "content": fallback,
+                "state": initial_state,
+                "timestamp": now.isoformat(),
+            },
+        ]
+
+        session = ScenarioTrainingSession(
+            id=session_id,
+            owner_id=payload.ownerId,
+            task_id=f"v1-{payload.scenarioType}",
+            fraud_type=payload.scenarioType,
+            current_state=initial_state,
+            messages_json=json.dumps(initial_messages, ensure_ascii=False),
+            identified_evidence_json="[]",
+            user_behaviors_json="[]",
+            ai_enabled=False,  # Phase 1 全部规则驱动
+            started_at=now,
+        )
+        db.add(session)
+        db.commit()
+
+        return {
+            "sessionId": session_id,
+            "scenarioType": payload.scenarioType,
+            "currentState": initial_state,
+            "stateName": get_state_prompt(payload.scenarioType, initial_state),
+            "initialMessage": fallback,
+            "allEvidence": get_all_evidence(payload.scenarioType),
+        }
+
+    @app.post("/api/v1/training/scenario/{session_id}/reply")
+    def v1_scenario_reply(session_id: str, payload: ScenarioReplyV1Request, db: Session = Depends(get_db)) -> dict[str, object]:
+        """v1: FSM 推进一轮 + 保存 EvidenceRecord（Phase 1 无 AI）。"""
+        from .scenario_state_machine import (
+            classify_user_behavior,
+            transition,
+            get_state_name,
+            get_fallback_reply,
+        )
+
+        session = db.get(ScenarioTrainingSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session.status != "active":
+            raise HTTPException(status_code=400, detail="Session is not active")
+
+        # 分类用户行为
+        behavior = classify_user_behavior(payload.message)
+
+        # 推进状态机
+        result = transition(session.fraud_type, session.current_state, behavior)
+        new_state = result["newState"]
+        new_evidence = result["evidence"]
+        is_terminal = result["isTerminal"]
+
+        # 更新已识别证据
+        identified = json.loads(session.identified_evidence_json)
+        for ev in new_evidence:
+            if ev not in identified:
+                identified.append(ev)
+
+        # 更新用户行为记录
+        behaviors = json.loads(session.user_behaviors_json)
+        behaviors.append({
+            "message": payload.message[:100],
+            "behavior": behavior,
+            "state": session.current_state,
+        })
+
+        # 生成骗子回复 — Phase 1 使用规则兜底（按用户行为和消息内容选择话术）
+        scammer_reply = get_fallback_reply(session.fraud_type, new_state, behavior, payload.message)
+
+        # 保存 EvidenceRecord（新增识别证据）
+        turn_order = len(behaviors)
+        for ev in new_evidence:
+            evidence_rec = EvidenceRecord(
+                owner_id=session.owner_id,
+                session_id=session_id,
+                turn_order=turn_order,
+                evidence_tag=ev,
+                identified=True,
+                is_key=True,
+            )
+            db.add(evidence_rec)
+
+        # 更新消息列表
+        messages = json.loads(session.messages_json)
+        now = datetime.utcnow()
+        messages.append({
+            "role": "user",
+            "content": payload.message,
+            "behavior": behavior,
+            "timestamp": now.isoformat(),
+        })
+        if not is_terminal:
+            messages.append({
+                "role": "scammer",
+                "content": scammer_reply,
+                "source": "rule",
+                "state": new_state,
+                "timestamp": now.isoformat(),
+            })
+            # 反诈守护者提示
+            messages.append({
+                "role": "guardian",
+                "content": "【反诈守护者提示】请思考对方话术中的风险信号，及时识别并拒绝。",
+                "timestamp": now.isoformat(),
+            })
+        else:
+            messages.append({
+                "role": "system",
+                "content": "恭喜！你成功识破了诈骗骗局！",
+                "timestamp": now.isoformat(),
+            })
+
+        # 更新会话
+        session.current_state = new_state
+        session.messages_json = json.dumps(messages, ensure_ascii=False)
+        session.identified_evidence_json = json.dumps(identified, ensure_ascii=False)
+        session.user_behaviors_json = json.dumps(behaviors, ensure_ascii=False)
+
+        if is_terminal or new_state in ("S4", "S5"):
+            session.status = "completed"
+            session.completed_at = now
+
+        db.commit()
+
+        return {
+            "sessionId": session_id,
+            "behavior": behavior,
+            "newState": new_state,
+            "stateName": get_state_name(session.fraud_type, new_state),
+            "scammerReply": scammer_reply if not is_terminal else "（对话已结束）",
+            "replySource": "rule",
+            "identifiedEvidence": identified,
+            "newEvidence": new_evidence,
+            "isTerminal": is_terminal,
+            "isCompleted": session.status == "completed",
+        }
+
+    @app.post("/api/v1/training/scenario/{session_id}/finish")
+    def v1_scenario_finish(session_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+        """v1: 结束训练 — 生成复盘报告 + 保存 ReviewReport + 更新能力快照。"""
+        from .review_engine import generate_review_rule
+        from .retrain_scheduler import schedule_retrain
+        from .ability_profile import compute_ability_profile
+        from sqlalchemy import desc
+
+        session = db.get(ScenarioTrainingSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # 强制结束
+        now = datetime.utcnow()
+        session.status = "completed"
+        session.completed_at = now
+        db.commit()
+
+        # 构建 session_data 供复盘引擎使用
+        session_data = {
+            "fraudType": session.fraud_type,
+            "scenarioType": session.fraud_type,
+            "finalState": session.current_state,
+            "identifiedEvidence": json.loads(session.identified_evidence_json),
+            "userBehaviors": json.loads(session.user_behaviors_json),
+            "messages": json.loads(session.messages_json),
+        }
+
+        # 规则引擎生成复盘报告
+        review = generate_review_rule(session_data)
+        dim_scores = review.get("dimScores", {})
+        evidence_dim_score = dim_scores.get("evidence", float(review.get("abilityChange", {}).get("证据力", 0)))
+
+        # 保存 ReviewReport 到数据库
+        report_id = f"rpt-{secrets.token_hex(8)}"
+        report = ReviewReport(
+            id=report_id,
+            session_id=session_id,
+            owner_id=session.owner_id,
+            identified_evidence_json=json.dumps(review.get("identifiedEvidence", []), ensure_ascii=False),
+            missed_evidence_json=json.dumps(review.get("missedEvidence", []), ensure_ascii=False),
+            correct_behaviors_json=json.dumps(
+                [b.get("behavior", "") for b in review.get("correctBehaviors", [])], ensure_ascii=False
+            ),
+            risk_behaviors_json=json.dumps(
+                [b.get("behavior", "") for b in review.get("riskyBehaviors", [])], ensure_ascii=False
+            ),
+            recognition_score=float(review.get("abilityChange", {}).get("识诈力", 0)),
+            judgment_score=float(dim_scores.get("judgment", 0)),
+            response_score=float(review.get("abilityChange", {}).get("应对力", 0)),
+            evidence_score=float(evidence_dim_score),
+            help_score=float(dim_scores.get("help", 0)),
+            total_score=float(review.get("score", 0)),
+            next_suggestions_json=json.dumps(review.get("nextSteps", []), ensure_ascii=False),
+            ai_generated=False,
+            created_at=now,
+        )
+        db.add(report)
+
+        # 更新能力快照（基于本次训练表现）
+        ability_change = review.get("abilityChange", {})
+        prev_snapshot = (
+            db.query(AbilitySnapshot)
+            .filter(AbilitySnapshot.owner_id == session.owner_id)
+            .order_by(desc(AbilitySnapshot.created_at))
+            .first()
+        )
+        prev_scores: dict[str, float] = json.loads(prev_snapshot.scores_json) if prev_snapshot else {}
+
+        # 计算新得分：在旧得分基础上加 abilityChange 的增量
+        new_scores: dict[str, float] = {dim: prev_scores.get(dim, 0.0) for dim in ["识诈力", "判断力", "应对力", "证据力", "求助力"]}
+        for dim, delta in ability_change.items():
+            if dim in new_scores:
+                new_scores[dim] = min(100, new_scores[dim] + float(delta))
+
+        overall = round(sum(new_scores.values()) / 5, 1)
+        weak = [dim for dim, s in new_scores.items() if s < 50]
+
+        snapshot = AbilitySnapshot(
+            owner_id=session.owner_id,
+            scores_json=json.dumps(new_scores, ensure_ascii=False),
+            weak_dimensions_json=json.dumps(weak, ensure_ascii=False),
+            weak_types_json="[]",
+            total_growth=int(sum(float(v) for v in ability_change.values())),
+            trigger_event="scenario",
+            trigger_ref=session_id,
+        )
+        db.add(snapshot)
+        db.flush()  # 获取 snapshot.id
+
+        for dim in ["识诈力", "判断力", "应对力", "证据力", "求助力"]:
+            score_before = prev_scores.get(dim, 0.0)
+            score_after = new_scores[dim]
+            delta_val = round(score_after - score_before, 1)
+            event = AbilityEvent(
+                snapshot_id=snapshot.id,
+                owner_id=session.owner_id,
+                dim_key=dim,
+                score_before=score_before,
+                score_after=score_after,
+                delta=delta_val,
+            )
+            db.add(event)
+
+        # 精简历史快照
+        all_snaps = (
+            db.query(AbilitySnapshot)
+            .filter(AbilitySnapshot.owner_id == session.owner_id)
+            .order_by(desc(AbilitySnapshot.created_at))
+            .all()
+        )
+        if len(all_snaps) > 30:
+            keep_ids = {s.id for s in all_snaps[:30]} | {all_snaps[-1].id}
+            for s in all_snaps:
+                if s.id not in keep_ids:
+                    db.query(AbilityEvent).filter(AbilityEvent.snapshot_id == s.id).delete()
+                    db.delete(s)
+
+        # 生成错题复训任务（基于遗漏证据）
+        missed_evidence = review.get("missedEvidence", [])
+        if missed_evidence:
+            wrong_items = [{
+                "questionId": f"scn-{session.id}",
+                "taskId": session.task_id or "",
+                "fraudType": session.fraud_type,
+                "abilityDim": "识诈力",
+            }]
+            retrain_tasks_data = schedule_retrain(wrong_items, now)
+            for rt in retrain_tasks_data:
+                retrain_task = RetrainTask(
+                    owner_id=session.owner_id,
+                    original_question_id=rt["originalQuestionId"],
+                    original_task_id=rt["originalTaskId"],
+                    fraud_type=rt["fraudType"],
+                    target_ability=rt["targetAbility"],
+                    attempt=rt["attempt"],
+                    scheduled_at=datetime.fromisoformat(rt["scheduledAt"]),
+                    status="pending",
+                    variant_strategy=rt["variantStrategy"],
+                )
+                db.add(retrain_task)
+
+        db.commit()
+
+        return {
+            "sessionId": session_id,
+            "review": review,
+            "abilitySnapshot": {
+                "scores": new_scores,
+                "overall": overall,
+                "weakDimensions": weak,
+                "growthThisRound": int(sum(float(v) for v in ability_change.values())),
+            },
+        }
+
+    @app.get("/api/v1/training/scenario/sessions/{session_id}")
+    def v1_get_scenario_session(session_id: str, db: Session = Depends(get_db)) -> dict[str, object]:
+        """v1: 获取情景训练会话详情（页面恢复/刷新）。"""
+        session = db.get(ScenarioTrainingSession, session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return {
+            "sessionId": session.id,
+            "ownerId": session.owner_id,
+            "scenarioType": session.fraud_type,
+            "currentState": session.current_state,
+            "status": session.status,
+            "messages": json.loads(session.messages_json),
+            "identifiedEvidence": json.loads(session.identified_evidence_json),
+            "aiEnabled": session.ai_enabled,
+            "startedAt": session.started_at.isoformat(),
+            "completedAt": session.completed_at.isoformat() if session.completed_at else None,
+        }
+
+    return app
+
+
+app = create_app()

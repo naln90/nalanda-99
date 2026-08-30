@@ -1,0 +1,38 @@
+# ===== WorkBuddy 内部数据（非项目源码，勿提交） =====
+.workbuddy/
+
+# ===== 生成的预览产物（非源码） =====
+outputs/
+
+# ===== 操作系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# ===== Python 运行/缓存 =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 日志 =====
+*.log
+
+# ===== 杂项残留（pip 等产生的非源码残留） =====
+=0.0.5
+
+# ===== 数据库文件（含备份/测试库：.sqlite3 / .sqlite3.bak.* / .sqlite / .db） =====
+*.sqlite3*
+*.sqlite
+*.db
+*.db-*
+
+# ===== 本会话产生的临时恢复/清理脚本（非项目源码，勿提交） =====
+_recover_*
+_recover_plans.pkl
+_revert_backup/
+_sweep*.py
+

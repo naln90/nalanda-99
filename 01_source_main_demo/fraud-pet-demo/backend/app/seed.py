@@ -1,0 +1,1920 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .models import (
+    FraudCase,
+    GrowthRule,
+    KnowledgeItem,
+    Pet,
+    PetPool,
+    TrainingQuestion,
+    TrainingTask,
+    User,
+    VideoLibrary,
+)
+from .rules import level_bounds, pet_level, pet_stage
+
+
+PET_POOL = [
+    ("校园猫", "动物类", "机敏好奇，陪你打磨学习计划"),
+    ("守护犬", "动物类", "可靠坚定，提醒你按时完成任务"),
+    ("灵巧兔", "动物类", "反应迅速，帮你捕捉知识要点"),
+    ("巡逻机器人", "机器人类", "扫描信息来源，守护学习专注"),
+    ("学习小卫士", "机器人类", "佩戴徽章，陪伴完成每日训练"),
+    ("数据探测员", "机器人类", "用数据雷达发现可靠资料"),
+    ("麒麟", "守护兽类", "东方守护兽，象征坚持与判断力"),
+    ("醒狮", "守护兽类", "醒目机敏，激励持续学习"),
+    ("玄鸟", "守护兽类", "数据光翼，快速检索知识"),
+]
+
+TRAINING_TASKS = [
+    # AI 素养
+    ("ai-prompt", "提示词工程基础训练", "AI 素养", "低风险", "低", 5, 30, 45),
+    ("ai-ethics", "AI 生成内容辨识与规范使用", "AI 素养", "中风险", "中等", 6, 40, 60),
+    # 网络安全
+    ("net-password", "账号密码与弱口令加固", "网络安全", "中风险", "低", 4, 30, 45),
+    ("net-phish", "钓鱼链接与仿冒页面识别", "网络安全", "高风险", "中等", 6, 45, 70),
+    ("net-wifi", "公共 Wi-Fi 与数据泄露防护", "网络安全", "中风险", "中等", 5, 35, 55),
+    # 心理健康
+    ("mental-stress", "学业压力自我调节", "心理健康", "低风险", "低", 5, 30, 45),
+    ("mental-help", "心理求助渠道识别与使用", "心理健康", "低风险", "低", 4, 30, 45),
+    # 消防安全
+    ("fire-dorm", "宿舍用电与火灾隐患排查", "消防安全", "高风险", "低", 5, 40, 60),
+    ("fire-evac", "火场疏散与灭火器使用", "消防安全", "高风险", "中等", 6, 45, 70),
+    # 交通安全
+    ("traffic-ebike", "电动自行车与校园出行安全", "交通安全", "中风险", "低", 4, 30, 50),
+    # 求职就业
+    ("job-contract", "三方协议与劳动合同审读", "求职就业", "中风险", "中等", 6, 40, 60),
+    ("job-interview", "面试准备与求职信息核验", "求职就业", "低风险", "低", 5, 30, 50),
+    # 金融素养
+    ("fin-budget", "大学生预算与记账入门", "金融素养", "低风险", "低", 5, 30, 45),
+    ("fin-invest", "投资理财风险认知", "金融素养", "中风险", "中等", 6, 40, 65),
+    # 学术诚信
+    ("acad-cite", "文献引用与查重规范", "学术诚信", "低风险", "中等", 5, 35, 55),
+    ("acad-aiwrite", "AI 辅助写作的边界训练", "学术诚信", "中风险", "中等", 5, 35, 55),
+    # 个人信息保护
+    ("privacy-locate", "位置与社交隐私管理", "个人信息保护", "中风险", "低", 4, 30, 50),
+    ("privacy-app", "App 权限与个人信息授权", "个人信息保护", "中风险", "中等", 5, 35, 55),
+    # 校园安全
+    ("campus-crowd", "人群密集场所安全", "校园安全", "中风险", "低", 4, 30, 45),
+    # 应急避险
+    ("emergency-first", "突发事件应急与急救基础", "应急避险", "高风险", "中等", 6, 45, 70),
+]
+
+# 每个训练任务配套 3 道题，覆盖知识理解、情景判断、误区识别
+TRAINING_QUESTIONS = {
+    "ai-prompt": [
+        {
+            "id": "ai-prompt-q1",
+            "question_type": "single",
+            "stem": "想让 AI 输出更贴合需求的结果，最有效的做法是？",
+            "options": ["A. 把问题描述得越短越好", "B. 明确角色、任务、背景与输出格式", "C. 反复发送同一句话多试几次", "D. 用表情符号吸引 AI 注意"],
+            "correct_answer": "B",
+            "explanation": "清晰的提示词通常包含角色设定、具体任务、背景约束与期望的输出格式。模糊或过短的描述会让模型只能猜测意图，效果不稳定。",
+        },
+        {
+            "id": "ai-prompt-q2",
+            "question_type": "multiple",
+            "stem": "以下哪些属于有效的提示词优化技巧？",
+            "options": ["A. 给出示例让 AI 参考格式", "B. 说明输出篇幅与风格要求", "C. 要求 AI 分步骤推理", "D. 不提供任何背景直接提问"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "示例（few-shot）、明确的格式与篇幅约束、分步推理要求都能显著提升输出质量。缺少背景的提问会让模型难以定位场景。",
+        },
+        {
+            "id": "ai-prompt-q3",
+            "question_type": "single",
+            "stem": "AI 给出的答案中包含具体数据但未给出来源，正确的做法是？",
+            "options": ["A. 直接引用，AI 一般不会错", "B. 通过权威渠道核实后再使用", "C. 认为所有数据都是编造的，全部删除", "D. 只要答案流畅就不用核实"],
+            "correct_answer": "B",
+            "explanation": "生成式模型可能产生看似合理的虚构信息（幻觉）。涉及数据、引用、事实的内容应通过权威来源核实后再使用。",
+        },
+    ],
+    "ai-ethics": [
+        {
+            "id": "ai-ethics-q1",
+            "question_type": "multiple",
+            "stem": "判断一段内容是否可能由 AI 生成，可以关注哪些信号？",
+            "options": ["A. 内容高度模板化、缺少个人视角", "B. 引用的文献或数据无法溯源", "C. 表述与已知 AI 输出风格高度相似", "D. 内容里出现了汉字"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "模板化表达、不可溯源的引用、风格雷同都是 AI 生成内容的常见信号。判断应综合多个信号，任何单一信号都不能下结论。",
+        },
+        {
+            "id": "ai-ethics-q2",
+            "question_type": "single",
+            "stem": "课程作业中可以使用 AI 辅助的前提是？",
+            "options": ["A. 任何课程都完全禁止使用", "B. 遵守课程规定，并在允许范围内如实说明使用方式", "C. 只要查重能过就可以随意使用", "D. 用 AI 写完就当原创提交"],
+            "correct_answer": "B",
+            "explanation": "不同课程对 AI 工具的规定不同。学术诚信的核心是遵守课程要求、如实披露使用方式，并把 AI 当作辅助而非代写。",
+        },
+        {
+            "id": "ai-ethics-q3",
+            "question_type": "single",
+            "stem": "关于 AI 生成图片与视频，以下说法正确的是？",
+            "options": ["A. AI 生成的图片都可以随意商用", "B. 深度合成内容用于公开传播时需要标识，且不得用于伪造他人形象", "C. 只要不收钱就不算违规使用", "D. AI 生成内容没有版权和合规问题"],
+            "correct_answer": "B",
+            "explanation": "深度合成内容公开传播需按规定标识；伪造他人形象、声音可能侵犯肖像权、名誉权。商用还需注意训练数据与平台协议的授权范围。",
+        },
+    ],
+    "net-password": [
+        {
+            "id": "net-password-q1",
+            "question_type": "multiple",
+            "stem": "以下哪些密码属于弱口令？",
+            "options": ["A. 123456", "B. 手机号后六位", "C. zK9#mQ2$vL", "D. password"],
+            "correct_answer": ["A", "B", "D"],
+            "explanation": "连续数字、个人信息片段、常见单词都属于弱口令，可被字典攻击在极短时间内破解。强口令应足够长且混合大小写、数字与符号。",
+        },
+        {
+            "id": "net-password-q2",
+            "question_type": "single",
+            "stem": "多个网站使用同一个密码的最大风险是？",
+            "options": ["A. 容易忘记密码", "B. 一处泄露会导致所有账户被“撞库”攻击", "C. 输入速度变慢", "D. 密码会被自动加密"],
+            "correct_answer": "B",
+            "explanation": "攻击者拿到一处泄露的账号密码后，会用它批量尝试其他网站（撞库）。重要账户应使用独立密码，并借助密码管理器记忆。",
+        },
+        {
+            "id": "net-password-q3",
+            "question_type": "single",
+            "stem": "为校园统一认证账号加固，最值得开启的功能是？",
+            "options": ["A. 两步验证（多因素认证）", "B. 定期把密码告诉同学备份", "C. 用生日做密码方便记忆", "D. 关闭登录提醒通知"],
+            "correct_answer": "A",
+            "explanation": "多因素认证在密码之外增加第二道验证，即使密码泄露账户也不易被盗。密码不应交给他人，生日密码极易被猜中。",
+        },
+    ],
+    "net-phish": [
+        {
+            "id": "net-phish-q1",
+            "question_type": "multiple",
+            "stem": "收到“教务系统升级，请点击链接重新验证”的短信，哪些细节需要警惕？",
+            "options": ["A. 链接域名与学校官方域名不一致", "B. 要求在页面上输入统一认证账号密码", "C. 制造“今日截止”的紧迫感", "D. 短信号码是学校常用的官方号码"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "仿冒域名、索要账号密码、制造紧迫感是钓鱼信息的典型组合。官方通知不会通过陌生域名要求重新验证账号密码。",
+        },
+        {
+            "id": "net-phish-q2",
+            "question_type": "single",
+            "stem": "不确定一个链接是否安全时，最稳妥的做法是？",
+            "options": ["A. 先点开看看再说", "B. 通过学校官网或官方 App 的入口进入对应服务", "C. 转发给同学帮忙点", "D. 用手机流量打开就安全了"],
+            "correct_answer": "B",
+            "explanation": "访问重要服务应始终从官方入口（官网首页、官方 App）进入，而不是点击消息里的链接。换网络并不会降低钓鱼风险。",
+        },
+        {
+            "id": "net-phish-q3",
+            "question_type": "single",
+            "stem": "已经在仿冒页面输入了账号密码，第一步应该做什么？",
+            "options": ["A. 什么都不做，等系统自动恢复", "B. 立即通过官方渠道修改密码，并检查登录记录", "C. 给发链接的号码发短信要求删除", "D. 卸载手机上的所有 App"],
+            "correct_answer": "B",
+            "explanation": "第一时间修改密码能阻止攻击者继续使用凭据，同时检查异常登录记录、开启两步验证。联系发信方没有实际作用。",
+        },
+    ],
+    "net-wifi": [
+        {
+            "id": "net-wifi-q1",
+            "question_type": "multiple",
+            "stem": "使用公共场所免费 Wi-Fi 时，哪些行为存在风险？",
+            "options": ["A. 连接后直接登录网银或支付应用", "B. 连接名称与商家完全相同的开放网络而不确认", "C. 只浏览新闻资讯类网站", "D. 在 HTTP（非加密）页面输入个人信息"],
+            "correct_answer": ["A", "B", "D"],
+            "explanation": "公共 Wi-Fi 下的登录支付、仿冒热点、明文传输都可能泄露信息。涉及敏感操作应改用移动数据，并确认网络来源。",
+        },
+        {
+            "id": "net-wifi-q2",
+            "question_type": "single",
+            "stem": "如何判断网站是否启用了加密传输？",
+            "options": ["A. 网址以 https:// 开头且有安全锁标志", "B. 页面看起来很精美", "C. 加载速度快", "D. 有很多广告"],
+            "correct_answer": "A",
+            "explanation": "HTTPS 表示浏览器与网站之间的通信加密。页面美观与是否加密无关。在 HTTP 页面提交的信息可能被中间人截获。",
+        },
+        {
+            "id": "net-wifi-q3",
+            "question_type": "single",
+            "stem": "发现自己的账号在异地异常登录，合理的处置顺序是？",
+            "options": ["A. 忽略，可能是系统误报", "B. 立即修改密码并退出所有设备会话，再排查泄露原因", "C. 直接注销账号", "D. 把密码改成和另一个账号一样"],
+            "correct_answer": "B",
+            "explanation": "先改密码、踢出所有会话止损，再排查是密码复用、钓鱼还是设备问题导致的泄露，必要时开启两步验证。",
+        },
+    ],
+    "mental-stress": [
+        {
+            "id": "mental-stress-q1",
+            "question_type": "single",
+            "stem": "考试周出现持续失眠、注意力难以集中，比较合适的应对是？",
+            "options": ["A. 熬夜硬扛，考完再说", "B. 调整作息与复习计划，必要时预约学校心理咨询中心", "C. 通过暴饮暴食缓解", "D. 认为自己意志力太差"],
+            "correct_answer": "B",
+            "explanation": "持续睡眠问题需要调整节奏并主动求助。学校心理咨询是免费专业资源，寻求帮助是自我管理能力的体现而非软弱。",
+        },
+        {
+            "id": "mental-stress-q2",
+            "question_type": "multiple",
+            "stem": "以下哪些属于健康的压力调节方式？",
+            "options": ["A. 规律运动", "B. 与信任的朋友倾诉", "C. 把任务拆解成小目标逐步完成", "D. 长时间刷短视频逃避"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "运动、社会支持、任务拆解都能真正缓解压力。刷视频属于短期回避，长时间使用反而会加重焦虑和拖延。",
+        },
+        {
+            "id": "mental-stress-q3",
+            "question_type": "single",
+            "stem": "室友近期情绪低落、回避社交，你比较妥当的做法是？",
+            "options": ["A. 强行拉他出门散心", "B. 表达关心并倾听，告知学校心理支持渠道，必要时陪他预约", "C. 在班级群里公开讨论他的情况", "D. 与自己无关，不用管"],
+            "correct_answer": "B",
+            "explanation": "尊重对方意愿的陪伴与倾听最有效，同时把专业求助渠道告诉他。公开讨论他人心理状况可能造成二次伤害。",
+        },
+    ],
+    "mental-help": [
+        {
+            "id": "mental-help-q1",
+            "question_type": "multiple",
+            "stem": "遇到心理困扰时，可以使用的校内外求助渠道有哪些？",
+            "options": ["A. 学校心理咨询中心", "B. 辅导员或信任的老师", "C. 全国心理援助热线（如 12356）", "D. 网上陌生人的“偏方”建议"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "心理咨询中心、辅导员、官方心理热线都是可靠渠道。来路不明的建议可能延误干预甚至造成伤害。",
+        },
+        {
+            "id": "mental-help-q2",
+            "question_type": "single",
+            "stem": "关于心理咨询，以下说法正确的是？",
+            "options": ["A. 只有“有病”的人才需要心理咨询", "B. 心理咨询遵循保密原则，是面向所有人的正常支持服务", "C. 咨询一次就能解决所有问题", "D. 去咨询会被记录进档案影响就业"],
+            "correct_answer": "B",
+            "explanation": "心理咨询是常态化支持服务，遵循保密原则（自伤伤人等法定情形除外）。成长困扰、压力管理都可以咨询，通常需要多次过程。",
+        },
+        {
+            "id": "mental-help-q3",
+            "question_type": "single",
+            "stem": "同学向你透露了轻生念头，你应该？",
+            "options": ["A. 替他保密绝不告诉任何人", "B. 认真对待、稳定陪伴，第一时间告知辅导员或心理中心等专业力量", "C. 认为他只是开玩笑", "D. 给他讲道理让他“想开点”"],
+            "correct_answer": "B",
+            "explanation": "涉及生命安全的信号必须认真对待，保密不能凌驾于安全之上。应及时联结辅导员、心理中心等专业资源，并尽量陪伴。",
+        },
+    ],
+    "fire-dorm": [
+        {
+            "id": "fire-dorm-q1",
+            "question_type": "multiple",
+            "stem": "宿舍内以下哪些行为存在火灾隐患？",
+            "options": ["A. 使用大功率违规电器", "B. 插线板串接且覆盖易燃物", "C. 外出时给充电宝整夜充电无人看管", "D. 使用带有 3C 认证的正规台灯"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "大功率电器、串接插线板、无人看管充电都是宿舍火灾主因。使用 3C 认证产品并规范用电是基本要求。",
+        },
+        {
+            "id": "fire-dorm-q2",
+            "question_type": "single",
+            "stem": "发现宿舍电线绝缘层破损散发焦味，第一步应该？",
+            "options": ["A. 用胶带缠上继续用", "B. 立即断电并上报宿管或后勤部门处理", "C. 用水泼降温", "D. 拍照发朋友圈吐槽"],
+            "correct_answer": "B",
+            "explanation": "先断电消除起火条件，再由专业人员检修。带电情况下泼水极其危险，自行缠绕继续使用也会留下隐患。",
+        },
+        {
+            "id": "fire-dorm-q3",
+            "question_type": "single",
+            "stem": "关于电动车电池，正确的做法是？",
+            "options": ["A. 把电池带回宿舍充电更方便", "B. 在指定充电区域充电，不改装、不飞线充电", "C. 在楼道里充电有人看着就行", "D. 购买无标识的低价电池"],
+            "correct_answer": "B",
+            "explanation": "锂电池热失控速度极快，入室、楼道、飞线充电都是重大隐患。应使用指定充电设施与合规电池。",
+        },
+    ],
+    "fire-evac": [
+        {
+            "id": "fire-evac-q1",
+            "question_type": "single",
+            "stem": "教学楼火警响起且确认有烟，撤离时应？",
+            "options": ["A. 乘电梯快速下楼", "B. 用湿毛巾捂住口鼻，低姿沿疏散指示标志从楼梯撤离", "C. 躲进教室等烟散了再走", "D. 返回取回落在教室的贵重物品"],
+            "correct_answer": "B",
+            "explanation": "电梯断电会困人；火灾中的烟雾蔓延很快，返回取物、原地等待都极其危险。低姿、捂口鼻、走楼梯、认指示是标准撤离动作。",
+        },
+        {
+            "id": "fire-evac-q2",
+            "question_type": "single",
+            "stem": "干粉灭火器的正确使用步骤是？",
+            "options": ["A. 拔保险销、握住喷管对准火焰根部、压下手柄", "B. 对准火焰上方喷射", "C. 先把灭火器用力摇晃一分钟", "D. 站在下风口使用"],
+            "correct_answer": "A",
+            "explanation": "记住“提、拔、握、压”：对准火焰根部而非上方，站在上风向。油火、电气火初期可用干粉扑救，火势失控应立即撤离报警。",
+        },
+        {
+            "id": "fire-evac-q3",
+            "question_type": "single",
+            "stem": "被大火困在房间无法撤离时，应该？",
+            "options": ["A. 破窗跳楼求生", "B. 关闭房门，用湿布堵住门缝，在窗口呼救并拨打 119 报告位置", "C. 躲进衣柜里", "D. 打开所有门窗通风"],
+            "correct_answer": "B",
+            "explanation": "固守待援时要关门断火、堵烟、窗口示警并准确报告位置。盲目跳楼致死率高，敞开门窗会加速烟火进入。",
+        },
+    ],
+    "traffic-ebike": [
+        {
+            "id": "traffic-ebike-q1",
+            "question_type": "multiple",
+            "stem": "校园内骑行电动自行车，以下哪些做法是安全的？",
+            "options": ["A. 佩戴安全头盔", "B. 在非机动车道或指定区域骑行并控制车速", "C. 戴耳机边骑边听歌", "D. 载两名同学抄近道逆行"],
+            "correct_answer": ["A", "B"],
+            "explanation": "头盔可在事故中大幅降低头部伤害风险。戴耳机影响对环境声的感知，超载、逆行是校园交通事故的高发原因。",
+        },
+        {
+            "id": "traffic-ebike-q2",
+            "question_type": "single",
+            "stem": "夜间在光线较暗的路段骑行，最应注意的是？",
+            "options": ["A. 开启车灯并穿浅色或反光衣物", "B. 骑得越快越早通过越好", "C. 关闭车灯省电", "D. 紧贴路边盲区骑行"],
+            "correct_answer": "A",
+            "explanation": "被看见是夜间骑行安全的核心：车灯既照亮路面也让他人发现你。加速通过、贴盲区骑行都会放大风险。",
+        },
+        {
+            "id": "traffic-ebike-q3",
+            "question_type": "single",
+            "stem": "过没有信号灯的校园路口时，正确做法是？",
+            "options": ["A. 减速观察，确认安全后通过", "B. 鸣笛示意后直接冲过去", "C. 跟着前面的人走就行不用看", "D. 边看手机边慢慢通过"],
+            "correct_answer": "A",
+            "explanation": "无灯路口依靠“一慢二看三通过”。鸣笛冲刺、盲目跟车、分心看手机都是事故常见诱因。",
+        },
+    ],
+    "job-contract": [
+        {
+            "id": "job-contract-q1",
+            "question_type": "multiple",
+            "stem": "签署三方协议或劳动合同时，应重点核对哪些内容？",
+            "options": ["A. 岗位、工作地点与薪酬待遇", "B. 试用期时长与违约条款", "C. 五险一金等社会保障条款", "D. 公司前台装修是否气派"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "合同核心是权利义务：薪酬、试用期（法定上限）、社保、违约责任都直接影响自身权益。办公环境好坏与合同条款无关。",
+        },
+        {
+            "id": "job-contract-q2",
+            "question_type": "single",
+            "stem": "offer 上写“入职后签订合同”，对方却要求先交“培训费/押金”，应该？",
+            "options": ["A. 先交钱保住机会", "B. 拒绝缴纳——用人单位收取押金、扣押证件均属违法，并向学校就业指导中心求证", "C. 讨价还价少交一点", "D. 交钱后保留发票就没问题"],
+            "correct_answer": "B",
+            "explanation": "劳动合同法明确禁止用人单位要求劳动者提供担保或收取财物。正规单位不会在入职前收费，遇到此类要求应警惕并求证。",
+        },
+        {
+            "id": "job-contract-q3",
+            "question_type": "single",
+            "stem": "合同中“最终解释权归公司所有”这类条款的效力如何？",
+            "options": ["A. 完全有效，公司说了算", "B. 排除劳动者主要权利的格式条款可能无效，可要求修改或求助就业指导中心", "C. 只要不签字就无所谓", "D. 签了就必须无条件接受"],
+            "correct_answer": "B",
+            "explanation": "格式条款不得不合理地免除自身责任、排除对方主要权利，否则可能被认定无效。签约前逐条阅读、对模糊条款要求书面澄清。",
+        },
+    ],
+    "job-interview": [
+        {
+            "id": "job-interview-q1",
+            "question_type": "multiple",
+            "stem": "核实一家招聘公司的真实性，可以通过哪些途径？",
+            "options": ["A. 企业信用信息公示系统查注册信息", "B. 公司官网与官方招聘渠道比对", "C. 向学校就业指导中心或学长学姐了解", "D. 只看中介发来的“内部offer”截图"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "官方信用公示、官网渠道、校内资源都是可靠信源。仅凭中介截图无法验证真实性，“内部渠道”话术常被用于包装虚假招聘。",
+        },
+        {
+            "id": "job-interview-q2",
+            "question_type": "single",
+            "stem": "面试通知把地点约在偏僻居民楼，比较稳妥的做法是？",
+            "options": ["A. 单独准时赴约以示诚意", "B. 提出改约在办公场所或公共场所，并告知同学行程", "C. 带上现金以备不时之需", "D. 拉黑不再联系即可，无需警惕"],
+            "correct_answer": "B",
+            "explanation": "正规面试通常在办公场所。可要求更换地点、结伴同行并告知他人行程。人身安全永远优先于面试机会。",
+        },
+        {
+            "id": "job-interview-q3",
+            "question_type": "single",
+            "stem": "面试中被要求提供身份证原件“暂扣”和银行卡密码，应该？",
+            "options": ["A. 配合，正规流程都需要", "B. 明确拒绝——任何单位无权扣押证件或索要密码", "C. 只给密码不给证件", "D. 给复印件并附上密码"],
+            "correct_answer": "B",
+            "explanation": "扣押身份证件违反居民身份证法；银行卡密码任何机构都无权索取。入职材料通常只需复印件且本人注明用途。",
+        },
+    ],
+    "fin-budget": [
+        {
+            "id": "fin-budget-q1",
+            "question_type": "single",
+            "stem": "每月生活费常在月底“莫名见底”，改善的第一步是？",
+            "options": ["A. 月初就把钱全花完", "B. 记录一到两个月收支，弄清钱花在哪里再分类设预算", "C. 办更多信用卡周转", "D. 让父母增加生活费"],
+            "correct_answer": "B",
+            "explanation": "记账是预算的前提：先看清消费结构，再区分必要/弹性支出并设定限额。以贷养贷只会放大缺口。",
+        },
+        {
+            "id": "fin-budget-q2",
+            "question_type": "multiple",
+            "stem": "适合大学生的基础理财习惯有哪些？",
+            "options": ["A. 先储蓄后消费，每月固定存一笔应急金", "B. 大额消费前设置“冷静期”", "C. 了解利率、复利等基本概念", "D. 跟风把生活费投入高波动炒作"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "应急储蓄、冷静期、基础金融常识是三大基石。用生活费参与高风险投机一旦亏损会直接影响基本生活。",
+        },
+        {
+            "id": "fin-budget-q3",
+            "question_type": "single",
+            "stem": "关于“分期免息”购物，正确的理解是？",
+            "options": ["A. 免息就是完全免费没有代价", "B. 需核对手续费、逾期罚息与总还款额，并评估自己持续还款能力", "C. 分期越多期越好", "D. 反正免息，能买多少买多少"],
+            "correct_answer": "B",
+            "explanation": "“免息”不等于零成本，可能收取手续费，逾期还会产生罚息并影响征信。分期总额应与稳定还款能力匹配。",
+        },
+    ],
+    "fin-invest": [
+        {
+            "id": "fin-invest-q1",
+            "question_type": "single",
+            "stem": "投资中“收益与风险相匹配”的基本含义是？",
+            "options": ["A. 收益越高风险越大，宣称“高收益零风险”的产品不可信", "B. 风险高的产品其实很安全", "C. 银行存款和股票风险一样", "D. 专家推荐的产品没有风险"],
+            "correct_answer": "A",
+            "explanation": "任何宣称保本高收益的产品都违背金融常识。常见非法集资正是用“稳赚不赔”话术吸收资金。",
+        },
+        {
+            "id": "fin-invest-q2",
+            "question_type": "multiple",
+            "stem": "作为投资新手，以下哪些做法比较稳妥？",
+            "options": ["A. 只用长期不影响生活的闲钱参与", "B. 先系统学习基础知识再小额尝试", "C. 分散配置而非押注单一品种", "D. 借钱加杠杆追热点"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "闲钱参与、先学后投、分散配置是新手三大原则。借钱投资会将波动放大为债务危机。",
+        },
+        {
+            "id": "fin-invest-q3",
+            "question_type": "single",
+            "stem": "看到“内部消息、导师带单、稳赚”的网络荐股群，应该？",
+            "options": ["A. 跟着导师操作躺赚", "B. 立即警惕并退出——荐股带单是常见非法证券活动套路", "C. 先小额跟单试试水", "D. 拉室友一起进群分摊风险"],
+            "correct_answer": "B",
+            "explanation": "“内部消息”“导师带单”是非法荐股与诈骗的典型话术，群内“盈利截图”多为托。可向证监局或反诈渠道举报。",
+        },
+    ],
+    "acad-cite": [
+        {
+            "id": "acad-cite-q1",
+            "question_type": "multiple",
+            "stem": "以下哪些行为构成学术不端？",
+            "options": ["A. 直接复制他人文字且不注明出处", "B. 把他人观点改写后当作自己的原创结论", "C. 伪造或篡改实验数据", "D. 规范引用并在参考文献中列出来源"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "抄袭、洗稿冒充原创、数据造假都是学术不端。规范引用并标注来源是被允许的正常学术行为。",
+        },
+        {
+            "id": "acad-cite-q2",
+            "question_type": "single",
+            "stem": "引用了一篇文献却记不清细节，正确的做法是？",
+            "options": ["A. 凭印象编一个页码和年份", "B. 回到原文核对后再引用，确保信息准确", "C. 不标注来源，混在正文里", "D. 多标几篇文献显得更专业"],
+            "correct_answer": "B",
+            "explanation": "引用必须真实准确：回到原文核对是最基本的要求。编造引用或堆砌无关文献同样属于学术不规范。",
+        },
+        {
+            "id": "acad-cite-q3",
+            "question_type": "single",
+            "stem": "关于查重报告，正确的理解是？",
+            "options": ["A. 重复率低就等于论文质量高", "B. 查重是辅助工具，合理引用被标红时可说明情况，核心是内容原创", "C. 用同义词替换把重复率降下来就行", "D. 先写完再想办法改到数字合格即可"],
+            "correct_answer": "B",
+            "explanation": "查重只是筛查手段：合理引用可能被误标，单纯同义词替换（洗稿）并不能改变抄袭实质。关键在于真实的研究与规范写作。",
+        },
+    ],
+    "acad-aiwrite": [
+        {
+            "id": "acad-aiwrite-q1",
+            "question_type": "single",
+            "stem": "课程允许“AI 辅助”时，以下哪种用法最符合规范？",
+            "options": ["A. 用 AI 生成整篇论文后署自己名字提交", "B. 用 AI 整理思路、润色语言，核心内容自己完成并如实说明使用情况", "C. 让 AI 编造参考文献充数", "D. 隐瞒 AI 使用痕迹避免麻烦"],
+            "correct_answer": "B",
+            "explanation": "AI 辅助的边界：辅助思考与表达可以，代替研究与写作不行；编造文献属于造假；按要求如实披露是诚信的体现。",
+        },
+        {
+            "id": "acad-aiwrite-q2",
+            "question_type": "multiple",
+            "stem": "使用 AI 工具辅助学习时，以下哪些做法值得提倡？",
+            "options": ["A. 用 AI 解释没读懂的概念", "B. 让 AI 对自己的初稿提出修改建议", "C. 把 AI 生成的文献列表直接写进参考文献", "D. 用 AI 生成的代码不做理解验证就提交"],
+            "correct_answer": ["A", "B"],
+            "explanation": "概念解释、初稿反馈是良性的学习辅助。AI 给出的文献可能不存在（幻觉文献），代码也可能有隐蔽错误，必须逐一核验。",
+        },
+        {
+            "id": "acad-aiwrite-q3",
+            "question_type": "single",
+            "stem": "AI 生成的文字“查重率很低”，这意味着？",
+            "options": ["A. 可以放心当原创提交", "B. 查重率低不等于合规，AI 代写违反学术诚信要求，且学校有专门的 AIGC 检测手段", "C. 说明 AI 写得比人好", "D. 只要没被发现就没问题"],
+            "correct_answer": "B",
+            "explanation": "AI 生成文本与传统查重逻辑不同，重复率低不代表合规。多数学校已明确 AI 代写的认定与处理办法，侥幸心理风险极高。",
+        },
+    ],
+    "privacy-locate": [
+        {
+            "id": "privacy-locate-q1",
+            "question_type": "multiple",
+            "stem": "以下哪些社交分享行为可能泄露个人隐私？",
+            "options": ["A. 晒出含宿舍号/门牌的定位照片", "B. 发布带实时位置的车票、机票", "C. 连续多日晒固定作息的健身轨迹", "D. 发布不含位置信息的风景照"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "定位、票据、固定轨迹都可能拼出你的生活规律与住址。分享前检查是否携带位置元数据，敏感信息打码。",
+        },
+        {
+            "id": "privacy-locate-q2",
+            "question_type": "single",
+            "stem": "和网上认识的人线下见面，比较稳妥的做法是？",
+            "options": ["A. 直接约在对方指定的私密场所", "B. 选择白天人多的公共场所，并告知朋友行程", "C. 把家庭住址发给对方以示信任", "D. 不告诉任何人，保持神秘感"],
+            "correct_answer": "B",
+            "explanation": "公共场所会面+行程报备是线下见面的基本安全底线。过早暴露住址或赴私密场所风险极高。",
+        },
+        {
+            "id": "privacy-locate-q3",
+            "question_type": "single",
+            "stem": "朋友圈发布的照片是否会泄露位置信息？",
+            "options": ["A. 不会，照片就是照片", "B. 可能——照片 EXIF 中含拍摄位置，且背景细节也可能暴露地点，发布前可关闭定位或去除元数据", "C. 只要不加定位标签就绝对安全", "D. 只有专业相机才有这个问题"],
+            "correct_answer": "B",
+            "explanation": "手机照片默认记录 GPS 信息（EXIF），背景招牌、路牌也能被识别。关闭相机定位或发送前处理元数据更稳妥。",
+        },
+    ],
+    "privacy-app": [
+        {
+            "id": "privacy-app-q1",
+            "question_type": "multiple",
+            "stem": "安装新 App 时，以下哪些权限授予需要警惕？",
+            "options": ["A. 手电筒 App 申请通讯录权限", "B. 普通游戏申请全程定位", "C. 输入法申请“始终允许”的麦克风权限", "D. 地图 App 申请定位权限"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "权限应与功能匹配：手电筒不需要通讯录，游戏不需要常驻定位，输入法麦克风常开可疑。地图用定位属于合理需求。",
+        },
+        {
+            "id": "privacy-app-q2",
+            "question_type": "single",
+            "stem": "注册某网站时被要求“同意整个通讯录以完成注册”，应该？",
+            "options": ["A. 同意，注册要紧", "B. 拒绝不必要的授权，换用合规产品或跳过该选项——个人信息受法律保护，收集须遵循最小必要原则", "C. 先同意，注册完再改回来就行", "D. 把通讯录先删空再同意"],
+            "correct_answer": "B",
+            "explanation": "个人信息保护法要求收集个人信息遵循最小必要原则并取得同意。与功能无关的强制授权可以拒绝，也可向网信部门投诉。",
+        },
+        {
+            "id": "privacy-app-q3",
+            "question_type": "single",
+            "stem": "要注销长期不用的 App 账号，正确认识是？",
+            "options": ["A. 卸载 App 就等于注销账号", "B. 卸载不等于注销，应通过官方渠道注销账号并要求删除个人信息", "C. 账号数据反正没人看", "D. 注销太麻烦，留着没关系"],
+            "correct_answer": "B",
+            "explanation": "卸载只移除了客户端，服务器仍留存数据。注销账号并行使删除权，才能降低信息被泄露或滥用的长期风险。",
+        },
+    ],
+    "campus-crowd": [
+        {
+            "id": "campus-crowd-q1",
+            "question_type": "single",
+            "stem": "在人员密集的晚会现场，安全的首要原则是？",
+            "options": ["A. 尽量挤到最前排看演出", "B. 关注出口位置，避免处在人流对冲的狭窄通道，感觉拥挤异常时提前离开", "C. 跟着人群走就不会有问题", "D. 站到应急通道口视野好"],
+            "correct_answer": "B",
+            "explanation": "密集场所应先确认出口、避开瓶颈位置；人群密度骤增是危险前兆，提前撤离优于被动跟随。堵塞应急通道本身也违规。",
+        },
+        {
+            "id": "campus-crowd-q2",
+            "question_type": "multiple",
+            "stem": "遇到人群拥挤推搡，哪些自我保护动作是有效的？",
+            "options": ["A. 双臂护住胸前保留呼吸空间", "B. 顺着人流方向侧身移动，向边缘靠拢", "C. 弯腰系鞋带或蹲下捡东西", "D. 逆着人流硬挤出去"],
+            "correct_answer": ["A", "B"],
+            "explanation": "护胸保呼吸、顺流侧移到边缘是踩踏自救要点。蹲下会被踩踏，逆行会引发对冲摔倒，都极其危险。",
+        },
+        {
+            "id": "campus-crowd-q3",
+            "question_type": "single",
+            "stem": "有人突然在拥挤通道摔倒并引发连锁倒地，周围人正确的第一反应是？",
+            "options": ["A. 围观拍照", "B. 大声呼喊“停止推进”，协助缓冲并就近呼救", "C. 加快脚步先离开现场", "D. 从倒地者身上跨过去"],
+            "correct_answer": "B",
+            "explanation": "踩踏链式反应的关键是立刻阻止后方推进。呼喊示警、手挽手缓冲、及时救助倒地者能有效中断连锁。",
+        },
+    ],
+    "emergency-first": [
+        {
+            "id": "emergency-first-q1",
+            "question_type": "single",
+            "stem": "遇到突发地震（在教学楼高层），第一反应应该？",
+            "options": ["A. 立刻乘电梯下楼", "B. 就地伏地、遮挡头部，躲在坚固桌下或承重墙角，震动停止后走楼梯有序撤离", "C. 跳窗逃生", "D. 站在窗边观察情况"],
+            "correct_answer": "B",
+            "explanation": "震时就近避险（伏地、遮挡、抓牢），震后走楼梯撤离是标准流程。电梯随时断电，跳窗与倚窗都极危险。",
+        },
+        {
+            "id": "emergency-first-q2",
+            "question_type": "single",
+            "stem": "同学突然倒地、意识丧失且无呼吸，应该？",
+            "options": ["A. 掐人中并喂水", "B. 立即拨打 120，取来 AED 并开始心肺复苏（胸外按压）", "C. 抬回宿舍让他休息", "D. 围观等待他人处理"],
+            "correct_answer": "B",
+            "explanation": "心脏骤停的黄金抢救时间只有几分钟：呼救（120+AED）+ 高质量胸外按压是唯一有效手段。掐人中、喂水、搬动都会延误抢救。",
+        },
+        {
+            "id": "emergency-first-q3",
+            "question_type": "multiple",
+            "stem": "拨打 120 急救电话时，应说清哪些关键信息？",
+            "options": ["A. 具体地点与醒目参照物", "B. 伤者意识和呼吸状况", "C. 伤者人数与大致伤情", "D. 自己的银行卡余额"],
+            "correct_answer": ["A", "B", "C"],
+            "explanation": "位置、病情、人数是调度派车与指导施救的三要素，说清参照物能加快到达速度。无关信息只会浪费时间。",
+        },
+    ],
+}
+
+
+RANKING_PETS = [
+    ("PET-1001", "U-2301**", "麒麟", "守护兽类", 3560, datetime.utcnow() - timedelta(minutes=8)),
+    ("PET-1048", "U-2402**", "守护犬", "动物类", 3420, datetime.utcnow() - timedelta(minutes=18)),
+    ("PET-2207", "U-2315**", "数据探测员", "机器人类", 3150, datetime.utcnow() - timedelta(minutes=29)),
+    ("PET-4432", "U-1765**", "学习小卫士", "机器人类", 2800, datetime.utcnow() - timedelta(minutes=40)),
+]
+
+
+def seed_database(session: Session) -> None:
+    if not session.scalar(select(PetPool).limit(1)):
+        session.add_all(
+            PetPool(pet_type=name, pet_category=category, description=description, enabled=True)
+            for name, category, description in PET_POOL
+        )
+
+    if not session.scalar(select(TrainingTask).limit(1)):
+        for task_id, title, fraud_type, risk_level, difficulty, duration, base_reward, max_reward in TRAINING_TASKS:
+            session.add(
+                TrainingTask(
+                    id=task_id,
+                    title=title,
+                    fraud_type=fraud_type,
+                    risk_level=risk_level,
+                    difficulty=difficulty,
+                    duration_minutes=duration,
+                    base_reward=base_reward,
+                    max_reward=max_reward,
+                    enabled=True,
+                )
+            )
+
+    # 训练题目：强制更新（先删后增），确保题目数量与题库定义一致
+    for task_id, questions in TRAINING_QUESTIONS.items():
+        existing = session.scalars(select(TrainingQuestion).where(TrainingQuestion.task_id == task_id)).all()
+        existing_ids = {q.id for q in existing}
+        expected_ids = {q["id"] for q in questions}
+        if existing_ids == expected_ids:
+            continue
+        for old_q in existing:
+            session.delete(old_q)
+        for question in questions:
+            session.add(
+                TrainingQuestion(
+                    id=question["id"],
+                    task_id=task_id,
+                    question_type=question["question_type"],
+                    stem=question["stem"],
+                    options_json=json.dumps(question["options"], ensure_ascii=False),
+                    correct_answer_json=json.dumps(question["correct_answer"], ensure_ascii=False),
+                    explanation=question["explanation"],
+                )
+            )
+
+    if not session.scalar(select(GrowthRule).limit(1)):
+        session.add_all(
+            [
+                GrowthRule(rule_key="formula", rule_value="最终成长值 = 基础完成分 + 正确率加成 + 难度加成", description="训练成长值计算公式"),
+                GrowthRule(rule_key="dailyMaxGrowth", rule_value="300", description="每日总成长值上限"),
+                GrowthRule(rule_key="taskMaxGrowth", rule_value="90", description="单任务成长值上限"),
+                GrowthRule(rule_key="suspiciousCheckDailyLimit", rule_value="3", description="可疑信息判断每日奖励次数"),
+            ]
+        )
+
+    # ── 知识库再平衡：移除过度冗余/重叠的反诈条目，使「反诈安全」回归 11 主题之一，
+    #    而非压倒数主题的主旋律（保留核心场景类型，其余主题在下方统一扩充）──
+    REMOVED_KNOWLEDGE_IDS = [
+        "know-million-protection", "know-loan-credit", "know-fake-shopping",
+        "know-porn-trap", "know-screen-share", "know-nfc-fraud", "know-cash-gold",
+        "know-bangxin", "know-crypto", "know-fake-leader", "know-points-clear",
+        "know-delivery-lead", "know-brush-flow", "know-gift-card",
+        "know-anti-fraud-tools", "know-20-keywords", "know-anti-fraud-rules",
+    ]
+
+    # 知识条目：按 ID 增量补充；插入时跳过已移除的冗余反诈条目，使种子列表本身即均衡，
+    # 保证「清空重建」与「增量补充」两种情况结果一致（反诈安全 20 条 / 其余主题各 5 条）。
+    knowledge_items_seed = [
+        KnowledgeItem(
+            id="know-ai-face",
+            category="AI换脸",
+            title="短视频确认不能替代电话核验",
+            risk_level="高风险",
+            typical_phrase="刚才视频你也看到了，是本人，先转钱别打电话。",
+            recognition_points="短暂视频、拒绝电话、催促转账同时出现。",
+            suggestions="使用原有电话、线下同学或官方渠道二次确认。",
+            related_task_id="ai-face",
+        ),
+        KnowledgeItem(
+            id="know-refund",
+            category="冒充客服",
+            title="退款不需要屏幕共享和验证码",
+            risk_level="高风险",
+            typical_phrase="退款需要开启屏幕共享，请提供验证码。",
+            recognition_points="屏幕共享、验证码、退款异常组合出现。",
+            suggestions="停止共享屏幕，通过官方 App 或客服电话核实。",
+            related_task_id="refund",
+        ),
+        KnowledgeItem(
+            id="know-brushing",
+            category="刷单返利",
+            title="先垫付后返利的兼职都是诈骗",
+            risk_level="高风险",
+            typical_phrase="日结高薪、先垫付、做满三单才能提现。",
+            recognition_points="垫付资金、高额返利、做满任务才提现三要素同时出现。",
+            suggestions="任何要求先垫付资金的兼职都涉嫌诈骗，立即停止并删除。",
+            related_task_id="brushing",
+        ),
+        KnowledgeItem(
+            id="know-investment",
+            category="虚假投资",
+            title="稳赚不赔是不存在的投资谎言",
+            risk_level="高风险",
+            typical_phrase="稳赚不赔、年化收益30%、老师带单。",
+            recognition_points="承诺高收益、私下转账入金、群里老师带单晒收益。",
+            suggestions="通过银行或持牌金融机构官方渠道理财，不转入个人账户。",
+            related_task_id="investment",
+        ),
+        KnowledgeItem(
+            id="know-game",
+            category="游戏交易",
+            title="保证金和解冻费是无底洞",
+            risk_level="中风险",
+            typical_phrase="账号交易需要先交保证金才能解冻提现。",
+            recognition_points="线下交易、保证金、解冻费、低价诱惑同时出现。",
+            suggestions="只在游戏官方或正规第三方平台交易，不私下转账。",
+            related_task_id="game",
+        ),
+        KnowledgeItem(
+            id="know-teacher-fee",
+            category="冒充老师",
+            title="群里收款码要先核实再付款",
+            risk_level="高风险",
+            typical_phrase="班级群发收款码，限时交资料费，账户为个人账户。",
+            recognition_points="群里突现收款码、催促限时交费、收款账户是个人账户。",
+            suggestions="通过学校已知联系方式直接联系老师本人核实，不在群里直接扫码。",
+            related_task_id="teacher-fee",
+        ),
+        KnowledgeItem(
+            id="know-verify-code",
+            category="账户安全",
+            title="验证码是账户最后一道防线",
+            risk_level="高风险",
+            typical_phrase="请把收到的验证码发给我，用于身份验证。",
+            recognition_points="任何人索要验证码，无论自称客服、银行还是公安。",
+            suggestions="验证码绝不提供给任何人，客服、银行、公安都不会索要验证码。",
+            related_task_id="anti-fraud-basics",
+        ),
+        KnowledgeItem(
+            id="know-pubsecurity",
+            category="冒充公检法",
+            title="公检法不会电话办案到安全账户",
+            risk_level="高风险",
+            typical_phrase="你涉嫌洗钱，请配合调查将资金转入安全账户自证清白。",
+            recognition_points="电话办案、安全账户、要求转账自证清白。",
+            suggestions="立即挂断并拨打110或96110报警，公检法不会通过电话要求转账。",
+            related_task_id="pubsecurity",
+        ),
+        # —— 以下为基于全网真实案例扩充的知识条目 ——
+        KnowledgeItem(
+            id="know-campus-loan",
+            category="校园贷",
+            title="“无抵押低息秒到账”背后是砍头息和高利贷",
+            risk_level="高风险",
+            typical_phrase="只需身份证，5分钟到账，零抵押零担保，月息仅1%。",
+            recognition_points="无抵押低息宣传、砍头息（到手金额少于借款）、7天短周期高息、逾期后诱导“以贷养贷”、暴力催收。",
+            suggestions="国家明令禁止向大学生发放校园贷；借款应通过银行等正规渠道；年利率超过LPR四倍（约14.8%）的部分不受法律保护；遇暴力催收向银保监会、教育部举报。",
+            related_task_id="campus-loan",
+        ),
+        KnowledgeItem(
+            id="know-cancel-campus-loan",
+            category="注销校园贷",
+            title="“注销校园贷记录否则影响征信”是新型诈骗",
+            risk_level="高风险",
+            typical_phrase="你大学期间注册过校园贷账户，不注销会影响个人征信，请按指引下载APP验证还款能力。",
+            recognition_points="冒充金融平台客服、以影响征信恐吓、要求下载陌生APP、屏幕共享或转账验证还款能力。",
+            suggestions="个人征信由央行统一管理，不存在“注销就能洗白”或“花钱修复”；接到此类电话通过官方APP核实，不下载陌生软件、不开启屏幕共享、不转账。",
+            related_task_id="campus-loan",
+        ),
+        KnowledgeItem(
+            id="know-training-loan",
+            category="培训贷",
+            title="“培训包就业分期付学费”是培训贷陷阱",
+            risk_level="高风险",
+            typical_phrase="包教包会短视频剪辑，轻松月入过万，可分期付学费，签订协议即安排兼职。",
+            recognition_points="技能培训+兼职保障打包宣传、诱导签订贷款协议、课程质量差且无法退费、贷款平台与培训机构分离。",
+            suggestions="警惕“先付费再推荐工作”的培训；《劳动合同法》规定用人单位不得向劳动者收取财物；签合同前看清贷款条款和退费规则，必要时联系辅导员确认。",
+            related_task_id="campus-loan",
+        ),
+        KnowledgeItem(
+            id="know-pig-butchering",
+            category="杀猪盘",
+            title="网恋交友+介绍投资是杀猪盘",
+            risk_level="高风险",
+            typical_phrase="我研究的这个投资/彩票稳赚不赔，带你一起赚钱，咱们将来买房安家。",
+            recognition_points="婚恋交友软件结识、迅速确立恋爱关系、长期嘘寒问暖“养猪”、介绍投资或博彩“杀猪”、提现受阻后失联。",
+            suggestions="没见过面的网友一谈钱即高度警惕；任何“稳赚”投资都是诈骗；网恋不转账；发现无法提现立即停止操作并报警。",
+            related_task_id="investment",
+        ),
+        KnowledgeItem(
+            id="know-impersonate-friend",
+            category="冒充熟人",
+            title="QQ/微信被盗冒充同学借钱要电话核验",
+            risk_level="高风险",
+            typical_phrase="我家属生病急用钱，微信没绑卡，你帮我转点到这个账号，再帮我充个话费。",
+            recognition_points="账号被盗、家属生病或急事催促、提供二维码或手机号要求转账充值、拒绝电话或语音核验。",
+            suggestions="任何熟人借钱都应通过原有电话或当面核实；留意账号语气、用词的异常变化；不扫来路不明的二维码；转账前务必二次确认对方身份。",
+            related_task_id="impersonate-friend",
+        ),
+        KnowledgeItem(
+            id="know-concert-ticket",
+            category="演唱会门票",
+            title="“内部票/代理费”演唱会门票诈骗",
+            risk_level="高风险",
+            typical_phrase="内部预留票原价转让，扫码支付锁定名额；或招募学生代理，交代理费赚生活费。",
+            recognition_points="脱离官方平台交易、要求扫码或微信转账、伪造订单截图、招代理收代理费、“没备注需重新转账”反复索款。",
+            suggestions="演唱会已实名制购票，只在官方票务平台购买；后援会从不私信集资；任何“内部票”都不靠谱；被要求连续转账即是诈骗，立即停止并报警。",
+            related_task_id="concert-ticket",
+        ),
+        KnowledgeItem(
+            id="know-flight-refund",
+            category="航班退改签",
+            title="“航班取消补偿退改签”是机票诈骗",
+            risk_level="高风险",
+            typical_phrase="您预订的航班因机械故障取消，请联系客服办理退改签并领取补偿金。",
+            recognition_points="境外电话或短信、冒充航司客服、要求下载APP开启屏幕共享、引导输入银行密码、要求转账领取补偿金。",
+            suggestions="通过航空公司官方APP或官网核实航班状态；正规退改签不要求屏幕共享、不要求转账；补偿金绝不会要求“先转账验证”；遇可疑电话直接挂断并致电航司官方客服。",
+            related_task_id="flight-refund",
+        ),
+        KnowledgeItem(
+            id="know-job-fee",
+            category="求职交费",
+            title="“入职先交保证金/体检费”是求职诈骗",
+            risk_level="中风险",
+            typical_phrase="岗位无学历要求月薪8000，入职需缴纳体检费、服装费、培训押金，入职后退还。",
+            recognition_points="高薪低门槛诱饵、入职前收取各类费用（体检费/服装费/培训押金）、收费后以“岗位调整”拖延、最终失联。",
+            suggestions="《劳动合同法》明确规定用人单位不得向劳动者收取财物；通过学校就业中心或正规招聘平台求职；坚决拒交任何抵押金、风险金、报名费、培训费。",
+            related_task_id="job-academic",
+        ),
+        KnowledgeItem(
+            id="know-secondhand",
+            category="二手交易",
+            title="“脱离平台先付定金”二手交易诈骗",
+            risk_level="中风险",
+            typical_phrase="走线下更便宜，先付定金留货，微信转账即可，发货单马上发你。",
+            recognition_points="闲鱼/小红书联系后要求脱离平台交易、要求先付定金或全款、提供虚假发货单、收款后拉黑。",
+            suggestions="二手交易必须走官方平台担保流程；不私下微信/支付宝转账；不购买无发票无保修的高价数码产品；对方催促脱离平台即警惕。",
+            related_task_id="secondhand",
+        ),
+        KnowledgeItem(
+            id="know-express-claim",
+            category="冒充快递理赔",
+            title="“包裹丢失理赔要屏幕共享”是升级版客服诈骗",
+            risk_level="高风险",
+            typical_phrase="您的包裹丢失可3倍赔偿，请下载会议APP开启屏幕共享办理理赔。",
+            recognition_points="冒充快递/电商客服、先打小额理赔款获取信任、要求下载小众会议APP、屏幕共享窃取银行卡号和验证码、转账盗刷。",
+            suggestions="屏幕共享等于“裸奔”，任何客服要求屏幕共享都是诈骗；通过快递公司或电商平台官方客服核实；不下载陌生人指定的APP；不向任何人提供验证码。",
+            related_task_id="refund",
+        ),
+        KnowledgeItem(
+            id="know-academic-fraud",
+            category="学术诈骗",
+            title="“论文代发/保研内定/竞赛包获奖”是学术骗局",
+            risk_level="中风险",
+            typical_phrase="30万打通关系保送名校，或交报名费保获奖，或论文代发包录用。",
+            recognition_points="代写论文收定金发拼凑内容、保研黑幕伪造材料致申请禁入、竞赛内定山寨组委会卷款跑路。",
+            suggestions="论文、竞赛、保研没有“钞能力”捷径；代写属于学术污点，被曝即开除；遇到此类骗局应举报，避免下一届同学受害。",
+            related_task_id="job-academic",
+        ),
+        KnowledgeItem(
+            id="know-free-gift",
+            category="免费领取",
+            title="“免费领取礼品+屏幕共享”是免费领诈骗",
+            risk_level="高风险",
+            typical_phrase="小红书免费领取围巾/行李箱，加QQ按指引操作即可，公司承担费用。",
+            recognition_points="免费领取诱饵、QQ语音+屏幕共享、引导充话费或购买虚拟产品、诱导开通花呗/微博借钱等借贷产品。",
+            suggestions="天上不会掉馅饼，不轻信“免费领取”；不与陌生人开启屏幕共享；不按陌生人指引开通借贷产品；发现被骗立即冻结账户并报警。",
+            related_task_id="free-gift",
+        ),
+        # —— 以下为基于国家反诈中心《2025版防范电信网络诈骗宣传手册》新增条目 ——
+        KnowledgeItem(
+            id="know-million-protection",
+            category="百万保障诈骗",
+            title="「百万保障」到期自动扣费？完全是诈骗！",
+            risk_level="高风险",
+            typical_phrase="您的微信/支付宝/抖音「百万保障」服务已到期，不关闭将每月自动扣费800元，请下载会议APP由客服指导关闭。",
+            recognition_points="冒充微信/支付宝/抖音平台客服、声称「百万保障」到期需续费或关闭、威胁自动扣费或影响征信、要求下载会议APP开启屏幕共享、引导转账验证资金。",
+            suggestions="「百万保障」是微信/支付宝等平台的免费安全服务，不会到期、不会扣费、不影响征信；接到此类电话立即挂断，通过官方APP客服核实；任何要求下载APP、屏幕共享、转账的都是诈骗。",
+            related_task_id="financial-scam",
+        ),
+        KnowledgeItem(
+            id="know-loan-credit",
+            category="贷款征信诈骗",
+            title="无抵押低息贷款先交费？贷款未到钱先没",
+            risk_level="高风险",
+            typical_phrase="您已获批30万额度，无抵押低利率秒到账，但需先交保证金/解冻费/刷流水激活账户。",
+            recognition_points="无抵押低息秒批宣传、要求先交保证金/解冻费/会员费、声称刷流水提升信用评级、「征信修复」骗局、放款前任何收费。",
+            suggestions="正规贷款机构在放款前不收任何费用；个人征信由央行统一管理，任何声称可「修复征信」的都是诈骗；不要将银行卡号、验证码提供给陌生人；有贷款需求通过银行等正规渠道。",
+            related_task_id="financial-scam",
+        ),
+        KnowledgeItem(
+            id="know-fake-shopping",
+            category="虚假购物服务",
+            title="脱离平台私下交易？付款后拉黑失联",
+            risk_level="中风险",
+            typical_phrase="平台手续费太高，走微信转账更便宜，先付款马上发货，转账后发物流单号。",
+            recognition_points="在社交平台（抖音/快手/小红书）看到低价商品广告、引诱脱离官方平台私下转账、付款后不发货或发空包、以「账号冻结/订单异常」为由诱导开启屏幕共享、教育机构退费名义诱导下载APP。",
+            suggestions="购物只走官方平台担保交易；不向个人微信/支付宝转账；不相信「内部价」「友情价」等低价诱饵；教育退费通过官方渠道，不下载陌生APP；遭遇诈骗保存证据并拨打110。",
+            related_task_id="financial-scam",
+        ),
+        KnowledgeItem(
+            id="know-porn-trap",
+            category="色情诱导诈骗",
+            title="色情小卡片+刷单任务=连环陷阱",
+            risk_level="高风险",
+            typical_phrase="扫码进群即可同城约会，完成任务还能返利赚钱，先充会员再解锁。",
+            recognition_points="色情小卡片/弹窗/短信引流、下载陌生APP或加群、以「完成任务即可获取色情服务」为诱饵要求垫资刷单、屏幕共享窃取通讯录后敲诈勒索。",
+            suggestions="传播色情信息及刷单均属违法行为；不扫描来路不明的小卡片二维码；不下载非官方应用商店的APP；遭遇敲诈勿转账，第一时间报警；洁身自好是最好的防护。",
+            related_task_id="brushing",
+        ),
+        KnowledgeItem(
+            id="know-screen-share",
+            category="屏幕共享诈骗",
+            title="屏幕共享=你的手机在裸奔",
+            risk_level="高风险",
+            typical_phrase="为方便办理退款/注销服务/配合调查，请下载会议APP并开启屏幕共享，我需要指导您操作。",
+            recognition_points="任何陌生人要求下载会议/远程控制类APP、要求开启屏幕共享或无障碍权限、以退款理赔/关闭扣费/配合调查为名、操作中手机突然黑屏或卡顿、提出「远程协助」「同步操作」。",
+            suggestions="屏幕共享会暴露银行卡号、密码、验证码等所有信息，相当于把保险柜钥匙交给骗子；任何客服/公检法/贷款机构要求屏幕共享的都是诈骗；已开启立即关闭并卸载该APP；同时拔卡断网防止继续操作。",
+            related_task_id="screen-nfc",
+        ),
+        KnowledgeItem(
+            id="know-nfc-fraud",
+            category="NFC盗刷",
+            title="手机NFC贴靠银行卡就能盗刷？这个功能要当心",
+            risk_level="高风险",
+            typical_phrase="为了验证您的卡片真实性，请将银行卡贴在手机背面，系统会自动读取验证。",
+            recognition_points="诱导将银行卡与手机NFC贴靠、声称「验证卡片」「激活账户」「绑定安全系统」、要求下载非官方APP开启NFC权限、后台读取并转移卡内资金。",
+            suggestions="切勿随意将手机与银行卡进行贴靠操作；不向陌生APP授权NFC功能；正规银行和支付平台不会通过电话引导NFC验证；发现NFC异常交易立即冻结银行卡并报警。",
+            related_task_id="screen-nfc",
+        ),
+        KnowledgeItem(
+            id="know-cash-gold",
+            category="寄送现金黄金",
+            title="要求取现金/买黄金再寄送？这是洗钱新套路",
+            risk_level="高风险",
+            typical_phrase="线上转账会被风控拦截，为了您的资金安全，请取出现金或购买黄金，通过网约车/快递送到指定地点，我们帮您充值。",
+            recognition_points="诱导线下取现或购买黄金/手机等高价值物品、要求通过网约车/快递/跑腿送达指定地点、以「避免风控」「安全充值」为理由、绝不使用正规线上支付渠道。",
+            suggestions="正规投资理财绝不会要求购买黄金后邮寄；凡是要求取现金/买黄金并通过网约车或快递交给陌生人的，都是诈骗洗钱；发现已被诱导操作，立即停止并拨打96110；快递员/金店员工遇异常大额购金应提高警惕。",
+            related_task_id="investment",
+        ),
+        KnowledgeItem(
+            id="know-bangxin",
+            category="帮信与两卡",
+            title="出租出借电话卡/银行卡=帮信罪，三年起步",
+            risk_level="高风险",
+            typical_phrase="借你银行卡转个账，给你500元辛苦费；或高价收购闲置电话卡，用途正当不用担心。",
+            recognition_points="高价收购/租借电话卡或银行卡、承诺「日结」「高额报酬」「不用干活」、提供两卡被用于诈骗/洗钱/赌博等犯罪活动。",
+            suggestions="根据《刑法》第287条之二，帮信罪最高可判处三年有期徒刑；任何出租、出借、出售两卡的行为均涉嫌违法犯罪；切勿因贪图小利成为「电诈工具人」；发现买卖两卡行为拨打96110举报。",
+            related_task_id="bangxin",
+        ),
+        KnowledgeItem(
+            id="know-crypto",
+            category="虚拟货币诈骗",
+            title="虚拟币投资稳赚不赔？平台都是假的",
+            risk_level="高风险",
+            typical_phrase="跟着老师买虚拟币，内幕消息包赚，前期先少量尝试，看到收益了再加大投入。",
+            recognition_points="宣称「内幕消息」「稳赚不赔」的虚拟币投资、搭建虚假交易平台显示虚假收益、前期小额可提现诱导大额投入、要求通过「币商」线下交易购买虚拟币、提现时以「缴税/解冻」为由再索款。",
+            suggestions="虚拟货币交易在中国不受法律保护；所有声称「稳赚」的虚拟币投资都是诈骗；不下载非应用商店的虚拟币交易APP；任何要求线下买币或邮寄现金换币的都是诈骗；发现异常立即停止操作并报警。",
+            related_task_id="investment",
+        ),
+        KnowledgeItem(
+            id="know-fake-leader",
+            category="冒充领导",
+            title="微信上的「领导」让你转账？先打电话核实",
+            risk_level="高风险",
+            typical_phrase="我是XXX（单位领导），这是我的新号，有个急事需要你帮忙转一笔款，事后报销。",
+            recognition_points="冒充单位领导/老师/上级、使用领导真实头像和职务信息、先嘘寒问暖后以「有急事」「不方便亲自操作」为由要求转账、「正在开会不方便接电话」拒绝语音核实。",
+            suggestions="任何领导/老师通过微信QQ要求转账汇款的，必须通过原有电话或当面核实；不按对方要求修改备注名或通讯录；发现异常立即向单位保卫部门或110报警。",
+            related_task_id="teacher-fee",
+        ),
+        KnowledgeItem(
+            id="know-points-clear",
+            category="积分清零诈骗",
+            title="「积分即将清零」的短信，点链接就中招",
+            risk_level="中风险",
+            typical_phrase="【XX银行】您的账户积分即将清零，请点击链接兑换礼品，过期无效！",
+            recognition_points="仿冒银行/运营商/电商平台发送积分清零短信、短信中含有钓鱼链接、点击后要求输入银行卡号/密码/验证码、跳转到仿冒页面窃取信息。",
+            suggestions="不点击短信中的不明链接；积分兑换通过官方APP或官方网站操作；任何要求输入银行卡密码和验证码的「积分兑换」都是诈骗；收到可疑短信直接删除并向官方客服核实。",
+            related_task_id="points-clear",
+        ),
+        KnowledgeItem(
+            id="know-delivery-lead",
+            category="快递引流诈骗",
+            title="快递包裹里的「扫码领奖」小卡片是陷阱",
+            risk_level="中风险",
+            typical_phrase="【恭喜中奖】扫码添加客服领20元红包/水果/礼品，限时领取先到先得！",
+            recognition_points="收到陌生快递中含有中奖/免费领礼品卡片、扫描二维码后添加陌生人微信拉入群聊、群内发布刷单或投资任务。",
+            suggestions="天下没有免费的午餐；不扫描快递包裹中的不明二维码；不进陌生群聊；「转发可领礼品」「邀请进群领红包」都是诈骗引流手段；未网购却收到包裹更需高度警惕。",
+            related_task_id="delivery-lead",
+        ),
+        KnowledgeItem(
+            id="know-brush-flow",
+            category="刷流水诈骗",
+            title="贷款「包装账户刷流水」？你在帮骗子洗钱",
+            risk_level="高风险",
+            typical_phrase="你的银行流水不够，我们需要帮你「包装账户」刷流水才能放款，先转一笔钱到指定账户验证。",
+            recognition_points="声称需「包装账户」「刷流水」「资质验资」才能放贷、要求向陌生账户转账制造虚假流水、「刷流水」本身是违法行为。",
+            suggestions="刷流水是违法行为，参与可能构成帮信罪；正规贷款不看「流水包装」；任何要求先转账「刷流水」再放款的都是诈骗；已被诱导操作后立即停止并报警。",
+            related_task_id="financial-scam",
+        ),
+        KnowledgeItem(
+            id="know-gift-card",
+            category="购物卡洗钱",
+            title="大量购买购物卡并提供卡密？你在帮骗子套现",
+            risk_level="高风险",
+            typical_phrase="平台系统升级暂时无法线上转账，请到超市购买购物卡，把卡号和密码发给我完成充值。",
+            recognition_points="要求大量购买超市购物卡/电商礼品卡、索要购物卡卡号和密码、「系统升级」「账户异常」等理由拒绝线上支付。",
+            suggestions="凡是要求大量购买购物卡并提供卡号和密码的，都是诈骗洗钱手法；正规投资和消费不会要求用购物卡支付；超市/便利店员工遇顾客大量购买购物卡应进行防骗提醒。",
+            related_task_id="financial-scam",
+        ),
+        KnowledgeItem(
+            id="know-anti-fraud-tools",
+            category="九大反诈利器",
+            title="国家九大反诈利器——给你的钱包装上防火墙",
+            risk_level="低风险",
+            typical_phrase="（工具介绍类）国家反诈中心APP、96110、12381、一证通查、一键查卡、反诈名片、一证通查2.0、境外来电提醒、AI内容鉴定。",
+            recognition_points="九大反诈利器全覆盖：①国家反诈中心APP（来电预警/APP自查/AI内容鉴定）②96110预警劝阻专线（来电请接听）③12381涉诈预警短信④全国移动电话卡一证通查⑤全国互联网账号一证通查2.0⑥云闪付一键查卡⑦反诈名片（标记警方来电）⑧境外来电提醒服务⑨2026新增：涉诈APP自检+AI内容鉴定。",
+            suggestions="立即下载国家反诈中心APP并实名注册开启来电预警；接到96110来电务必接听；定期使用一证通查和互联网账号一证通查清理不明号码和账号；开通运营商境外来电拦截功能。",
+            related_task_id="anti-fraud-basics",
+        ),
+        KnowledgeItem(
+            id="know-20-keywords",
+            category="二十个防诈关键词",
+            title="公安部提炼20个防诈关键词——快速破译骗局密码",
+            risk_level="高风险",
+            typical_phrase="屏幕共享、百万保障、安全账户、NFC盗刷、两卡、帮信行为、刷流水、积分清零、修复征信、快递引流、现金黄金、购物卡、内幕消息、电诈工具人、虚拟货币、色情小卡片、刷单做任务、未知链接和二维码、小众聊天软件、境外来电。",
+            recognition_points="听到这20个关键词立即警觉：1屏幕共享=裸奔 2百万保障=骗局 3安全账户=不存在 4NFC盗刷=新手法 5两卡=不能卖 6帮信罪=三年起步 7刷流水=违法 8积分清零=钓鱼 9修复征信=不可能 10快递引流=陷阱 11现金黄金=洗钱 12购物卡=套现 13内幕消息=谎言 14电诈工具人=帮凶 15虚拟货币=不受保护 16色情小卡片=刷单引流 17刷单做任务=诈骗 18未知链接和二维码=不点不扫 19小众聊天软件=规避监管 20境外来电=99%诈骗。",
+            suggestions="牢记三不一多原则：未知链接不点击、陌生来电不轻信、个人信息不透露、转账汇款多核实；遇到任何20个关键词中的情形立即警惕；下载国家反诈中心APP开启来电预警；遇可疑拨打96110咨询；被骗后立即拨打110并保留证据。",
+            related_task_id="anti-fraud-basics",
+        ),
+        KnowledgeItem(
+            id="know-anti-fraud-rules",
+            category="反诈总则",
+            title="反诈公式速记与「六不」原则",
+            risk_level="高风险",
+            typical_phrase="反诈公式：做任务+小额返利+大额投入=刷单；网恋+投资=杀猪盘；涉嫌违法+安全账户=冒充公检法。",
+            recognition_points="六不原则：不点陌生链接、不透露身份/验证码、不信高回报、不向陌生账户转账、不办非正规校园贷、不提供敏感区域照片。",
+            suggestions="牢记反诈公式速记快速识别骗局类型；安装「国家反诈中心」APP并开启来电预警；遇疑拨打96110反诈专线；被骗后立即止损、保留聊天和转账证据、拨打110报警。",
+            related_task_id="anti-fraud-basics",
+        ),
+    ]
+
+    # ── 新增：跨主题综合知识库条目 ──
+    # 覆盖网络安全、心理健康、消防安全、交通安全、求职就业、金融素养、
+    # 学术诚信、个人信息保护、校园安全、应急避险等主题，内容均标注权威来源。
+    knowledge_items_seed += [
+        # ===== 网络安全 =====
+        KnowledgeItem(
+            id="know-net-password",
+            theme="网络安全",
+            category="密码安全",
+            title="弱密码与重复使用密码是账户被盗主因",
+            risk_level="中风险",
+            typical_phrase="我的密码很简单，所有网站都用同一个，方便记忆。",
+            recognition_points="密码长度不足8位、使用连续数字或生日、多平台密码相同、未开启二次验证。",
+            suggestions="使用12位以上混合密码；不同平台使用不同密码；启用短信/邮箱/Authenticator二次验证；使用学校或官方推荐的密码管理工具。",
+            source="国家网络安全宣传周 / 中央网信办《网络安全知识手册》",
+            source_url="https://www.cac.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-net-phishing",
+            theme="网络安全",
+            category="钓鱼邮件",
+            title="钓鱼邮件常伪装成学校通知或快递信息",
+            risk_level="高风险",
+            typical_phrase="【学校教务处】您的成绩异常，请点击链接核实。",
+            recognition_points="发件人邮箱非官方域名、链接地址异常、要求输入账号密码、制造紧迫感。",
+            suggestions="不点击邮件中的可疑链接；通过学校官网或已知官方渠道核实；向学校信息化部门举报钓鱼邮件。",
+            source="国家互联网应急中心（CNCERT）",
+            source_url="https://www.cert.org.cn/",
+        ),
+        KnowledgeItem(
+            id="know-net-public-wifi",
+            theme="网络安全",
+            category="公共Wi-Fi",
+            title="公共Wi-Fi可能成为中间人攻击入口",
+            risk_level="中风险",
+            typical_phrase="这里有免费Wi-Fi，无需密码即可连接。",
+            recognition_points="无需密码的开放热点、热点名称与官方相似、连接后弹出要求登录的页面。",
+            suggestions="避免在公共Wi-Fi下进行网银、支付等敏感操作；优先使用手机流量或学校VPN；关闭自动连接Wi-Fi功能。",
+            source="公安部网络安全保卫局",
+            source_url="https://www.mps.gov.cn/",
+        ),
+        # ===== 心理健康 =====
+        KnowledgeItem(
+            id="know-mental-pressure",
+            theme="心理健康",
+            category="学业压力",
+            title="长期失眠与注意力下降可能是压力过载信号",
+            risk_level="中风险",
+            typical_phrase="最近总是睡不着，上课集中不了，但觉得自己能扛过去。",
+            recognition_points="持续两周以上情绪低落、睡眠或食欲明显改变、对以往感兴趣的事失去动力、社交回避。",
+            suggestions="及时向学校心理咨询中心预约；与辅导员或信任的人沟通；保持规律作息与适度运动；必要时寻求专业医疗机构评估。",
+            source="教育部全国高校学生心理健康教育工作推进会",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-mental-depression",
+            theme="心理健康",
+            category="抑郁识别",
+            title="抑郁情绪不等于抑郁症，但持续两周需重视",
+            risk_level="高风险",
+            typical_phrase="我就是最近心情不好，过段时间就好了，不用管我。",
+            recognition_points="情绪持续低落超过两周、兴趣减退、精力下降、自我评价过低、出现自伤念头。",
+            suggestions="消除病耻感，主动求助学校心理中心或医院精神科；陪伴倾听但不评判；出现自伤自杀念头立即联系危机干预热线。",
+            source="国家卫生健康委员会《抑郁症防治指南》",
+            source_url="http://www.nhc.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-mental-cyberbully",
+            theme="心理健康",
+            category="网络暴力",
+            title="遭遇网络暴力应保留证据并寻求支持",
+            risk_level="中风险",
+            typical_phrase="他们在网上到处转发我的信息，骂我，我不敢看手机。",
+            recognition_points="个人信息被恶意传播、遭受集中性侮辱威胁、因网络言论产生强烈恐惧或自责。",
+            suggestions="截图保存证据并向平台投诉；向学校、家长或警方求助；限制使用社交媒体时间；必要时寻求心理咨询支持。",
+            source="中国心理学会",
+            source_url="https://www.cpsbeijing.org/",
+        ),
+        # ===== 消防安全 =====
+        KnowledgeItem(
+            id="know-fire-dormitory",
+            theme="消防安全",
+            category="宿舍用电",
+            title="宿舍违规用电是校园火灾首要隐患",
+            risk_level="高风险",
+            typical_phrase="买个电煮锅在宿舍用，功率不大应该没事。",
+            recognition_points="使用大功率电器、私拉乱接电线、电器长时间通电、在床铺上使用明火或充电设备。",
+            suggestions="不使用电炉、电热毯、电煮锅等大功率或明火器具；人离断电；发现线路老化及时报修；熟悉宿舍楼消防设施位置。",
+            source="应急管理部消防救援局 / 教育部学校安全教育平台",
+            source_url="https://www.119.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-fire-escape",
+            theme="消防安全",
+            category="火灾逃生",
+            title="火灾逃生关键：低姿、捂口鼻、沿疏散指示",
+            risk_level="高风险",
+            typical_phrase="发生火灾时坐电梯快，或者躲进卫生间最安全。",
+            recognition_points="火灾时乘坐电梯、贪恋财物返回火场、盲目跳楼、不熟悉疏散通道。",
+            suggestions="火场逃生走楼梯，不乘电梯；用湿毛巾捂住口鼻低姿前行；按照疏散指示标志撤离；无法逃生时封堵门缝等待救援。",
+            source="应急管理部消防救援局",
+            source_url="https://www.119.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-fire-ebike",
+            theme="消防安全",
+            category="电动车充电",
+            title="电动车及电池严禁进楼入户充电",
+            risk_level="高风险",
+            typical_phrase="把电动车推到楼道充电，明天早上骑走方便。",
+            recognition_points="电动车进楼、电池入户、飞线充电、在楼梯间或安全出口停放。",
+            suggestions="在集中充电点充电；不改装电池和充电器；发现违规充电及时向学校保卫处或消防部门反映。",
+            source="应急管理部消防救援局《电动自行车消防安全提示》",
+            source_url="https://www.119.gov.cn/",
+        ),
+        # ===== 交通安全 =====
+        KnowledgeItem(
+            id="know-traffic-helmet",
+            theme="交通安全",
+            category="骑行安全",
+            title="骑乘电动自行车必须规范佩戴安全头盔",
+            risk_level="中风险",
+            typical_phrase="就几百米路，不戴头盔没事，戴头盔还热。",
+            recognition_points="骑行不戴头盔、逆行、闯红灯、载人超员、边骑车边看手机。",
+            suggestions="骑行前检查刹车和头盔；遵守交通信号；不逆行、不超载；分心骑行事故风险显著增加。",
+            source="公安部交通管理局《一盔一带安全守护行动》",
+            source_url="https://www.122.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-traffic-drunk",
+            theme="交通安全",
+            category="酒驾醉驾",
+            title="酒驾醉驾属严重交通违法，大学生同样追责",
+            risk_level="高风险",
+            typical_phrase="喝了点酒，叫代驾太贵，自己开回去应该没问题。",
+            recognition_points="饮酒后驾驶汽车、摩托车、电动车；侥幸心理；对代驾费用敏感。",
+            suggestions="牢记开车不喝酒、喝酒不开车；隔夜酒也可能超标；提前规划代驾或公共交通；醉驾将入刑并影响学业与就业。",
+            source="《中华人民共和国道路交通安全法》",
+            source_url="http://www.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-traffic-night",
+            theme="交通安全",
+            category="步行安全",
+            title="夜间步行应着亮色衣物并走人行设施",
+            risk_level="中风险",
+            typical_phrase="晚上穿深色衣服过马路，司机应该能看见。",
+            recognition_points="夜间穿深色衣物、过马路看手机、不走斑马线、闯红灯。",
+            suggestions="夜间出行穿浅色或反光衣物；过马路不玩手机；走人行横道并遵守信号灯；无信号灯路口注意观察。",
+            source="公安部交通管理局",
+            source_url="https://www.122.gov.cn/",
+        ),
+        # ===== 求职就业 =====
+        KnowledgeItem(
+            id="know-job-contract",
+            theme="求职就业",
+            category="劳动合同",
+            title="三方协议与劳动合同的法律效力不同",
+            risk_level="中风险",
+            typical_phrase="先签三方协议，劳动合同等转正后再签。",
+            recognition_points="只签三方不签劳动合同、试用期不缴纳社保、合同条款模糊不清、收取押金或证件。",
+            suggestions="入职一个月内签订书面劳动合同；确认工资、岗位、工作地点、社保缴纳等关键条款；拒交任何押金或证件。",
+            source="教育部学生服务与素质发展中心 / 人社部",
+            source_url="https://www.ncss.cn/",
+        ),
+        KnowledgeItem(
+            id="know-job-probation",
+            theme="求职就业",
+            category="试用期",
+            title="试用期权益受法律保护，最长不超过六个月",
+            risk_level="中风险",
+            typical_phrase="试用期工资打八折，不交社保，表现好再转正。",
+            recognition_points="试用期不缴社保、工资低于转正80%、随意延长试用期、试用期不签劳动合同。",
+            suggestions="试用期应签订劳动合同并缴纳社保；试用期工资不得低于本单位相同岗位最低档工资的80%；遇侵权可向劳动监察部门投诉。",
+            source="人力资源和社会保障部",
+            source_url="http://www.mohrss.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-job-fake-recruit",
+            theme="求职就业",
+            category="虚假招聘",
+            title="高薪低门槛、入职先交费多为虚假招聘",
+            risk_level="高风险",
+            typical_phrase="月薪过万无经验要求，先交培训费/体检费/服装费。",
+            recognition_points="薪酬明显高于市场水平、无学历经验要求、入职前收取费用、要求提供银行卡密码或验证码。",
+            suggestions="通过学校就业中心或正规招聘平台求职；任何入职前收费均违法；不将银行卡、手机卡出租出借给他人。",
+            source="教育部全国普通高等学校毕业生就业创业工作网络视频会议",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        # ===== 金融素养 =====
+        KnowledgeItem(
+            id="know-finance-credit",
+            theme="金融素养",
+            category="征信管理",
+            title="个人征信每年可免费查询两次",
+            risk_level="低风险",
+            typical_phrase="我听说征信可以花钱修复，还有内部渠道。",
+            recognition_points="声称花钱修复征信、注销校园贷账户否则影响征信、要求下载APP查看征信。",
+            suggestions="通过中国人民银行征信中心官网或银行App免费查询征信；不存在花钱修复征信；发现错误可依法提出异议申请。",
+            source="中国人民银行征信中心",
+            source_url="https://ipcrs.pbccrc.org.cn/",
+        ),
+        KnowledgeItem(
+            id="know-finance-consumption",
+            theme="金融素养",
+            category="理性消费",
+            title="超前消费与以贷养贷易陷入债务陷阱",
+            risk_level="中风险",
+            typical_phrase="这个月先用花呗/白条垫付，下个月再还。",
+            recognition_points="多头借贷、最低还款循环、以贷养贷、超过收入水平的消费。",
+            suggestions="量入为出，建立预算意识；优先使用自有资金；了解借贷实际年化利率；遇到还款困难及时向家人或学校求助。",
+            source="国家金融监督管理总局 / 中国人民银行",
+            source_url="http://www.cbirc.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-finance-illegal-raise",
+            theme="金融素养",
+            category="非法集资",
+            title="承诺保本高收益的投资多为非法集资",
+            risk_level="高风险",
+            typical_phrase="保本保息年化15%，身边同学都在投。",
+            recognition_points="承诺保本高收益、通过社交圈拉人头、无金融牌照、资金去向不明。",
+            suggestions="收益率超过6%就要打问号，超过8%很危险，超过10%就要做好损失全部本金的准备；投资前核查金融牌照。",
+            source="处置非法集资部际联席会议办公室",
+            source_url="http://www.cbirc.gov.cn/",
+        ),
+        # ===== 学术诚信 =====
+        KnowledgeItem(
+            id="know-academic-plagiarism",
+            theme="学术诚信",
+            category="论文抄袭",
+            title="论文抄袭可撤销学位并记入诚信档案",
+            risk_level="高风险",
+            typical_phrase="网上找几段话改改写写，查重应该能过。",
+            recognition_points="直接复制他人成果、伪造数据、代写代发论文、不当引用。",
+            suggestions="遵守学术规范，正确引用；使用学校查重系统自查；拒绝论文代写；了解学术不端的严重后果。",
+            source="教育部《高等学校预防与处理学术不端行为办法》",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-academic-exam",
+            theme="学术诚信",
+            category="考试作弊",
+            title="考试作弊不仅处分，还可能影响学位与就业",
+            risk_level="高风险",
+            typical_phrase="考试时偷偷看一眼应该不会被发现。",
+            recognition_points="携带违规物品、偷看他人答卷、使用通讯设备、组织替考。",
+            suggestions="严格遵守考场纪律；认识到作弊对诚信记录的长远影响；考试焦虑可通过正常复习和心理调节缓解。",
+            source="教育部《国家教育考试违规处理办法》",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-academic-data",
+            theme="学术诚信",
+            category="科研数据",
+            title="科研数据造假属于严重学术不端",
+            risk_level="高风险",
+            typical_phrase="为了结果显著，稍微调整一下原始数据应该没问题。",
+            recognition_points="篡改、伪造、选择性删除数据；图片拼接；重复发表。",
+            suggestions="如实记录和保存原始数据；实验失败也是科研过程的一部分；发现数据问题及时与导师沟通。",
+            source="科技部《科研失信行为调查处理规则》",
+            source_url="https://www.most.gov.cn/",
+        ),
+        # ===== 个人信息保护 =====
+        KnowledgeItem(
+            id="know-privacy-app",
+            theme="个人信息保护",
+            category="APP权限",
+            title="APP过度收集个人信息可拒绝授权并投诉",
+            risk_level="中风险",
+            typical_phrase="这个APP非要我开启通讯录和定位，不然不能用。",
+            recognition_points="APP强制索要无关权限、隐私政策冗长难懂、收集与功能无关的个人信息。",
+            suggestions="仅授予必要权限；阅读隐私政策中关于收集范围的关键条款；通过应用商店投诉或向网信部门举报过度收集行为。",
+            source="中央网信办《APP违法违规收集使用个人信息行为认定方法》",
+            source_url="https://www.cac.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-privacy-package",
+            theme="个人信息保护",
+            category="快递信息",
+            title="快递单含大量个人信息，丢弃前应去标识化",
+            risk_level="低风险",
+            typical_phrase="快递盒直接扔垃圾桶，反正没人注意。",
+            recognition_points="快递单暴露姓名、电话、住址；随意丢弃含个人信息的单据。",
+            suggestions="撕毁或涂抹快递单后再丢弃；使用快递柜或驿站代收；选择支持隐私面单的快递公司。",
+            source="国家邮政局",
+            source_url="http://www.spb.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-privacy-face",
+            theme="个人信息保护",
+            category="人脸识别",
+            title="人脸信息属于敏感个人信息，采集需单独同意",
+            risk_level="中风险",
+            typical_phrase="这个小程序要我刷脸认证，不刷就不能用。",
+            recognition_points="强制收集人脸信息、未告知用途、人脸数据存储位置不明。",
+            suggestions="非必要不授权人脸识别；询问数据存储与删除规则；发现违规收集可向网信部门投诉。",
+            source="最高人民法院《关于审理使用人脸识别技术处理个人信息相关民事案件适用法律若干问题的规定》",
+            source_url="https://www.court.gov.cn/",
+        ),
+        # ===== 校园安全 =====
+        KnowledgeItem(
+            id="know-campus-lab",
+            theme="校园安全",
+            category="实验室安全",
+            title="进入实验室必须了解危险源与应急措施",
+            risk_level="高风险",
+            typical_phrase="实验步骤我大概知道，不用看安全手册了。",
+            recognition_points="不熟悉实验流程、不佩戴防护装备、违规混合化学试剂、实验时离开岗位。",
+            suggestions="参加实验室安全培训；佩戴必要防护用品；了解紧急喷淋、洗眼器位置；发生事故立即报告老师。",
+            source="教育部《高等学校实验室安全规范》",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-campus-theft",
+            theme="校园安全",
+            category="宿舍防盗",
+            title="离开宿舍随手关门，贵重物品妥善保管",
+            risk_level="中风险",
+            typical_phrase="宿舍门忘锁了，反正楼里都是同学。",
+            recognition_points="宿舍无人不锁门、贵重物品随意放置、轻信陌生人进入宿舍、将钥匙借给无关人员。",
+            suggestions="养成随手关门锁门习惯；笔记本电脑等贵重物品入柜上锁；不随意带陌生人进宿舍；发现可疑人员及时报告宿管。",
+            source="教育部学校安全教育平台",
+            source_url="https://www.xueanquan.com/",
+        ),
+        KnowledgeItem(
+            id="know-campus-out",
+            theme="校园安全",
+            category="外出安全",
+            title="夜间外出应告知同伴并保持联系",
+            risk_level="中风险",
+            typical_phrase="我出去一下，不用跟谁说了。",
+            recognition_points="独自前往偏僻场所、夜间失联、乘坐无资质车辆、饮酒过量。",
+            suggestions="外出告知室友或辅导员去向；避免独自去偏僻地点；使用正规网约车并分享行程；聚会饮酒适量。",
+            source="教育部学校安全教育平台",
+            source_url="https://www.xueanquan.com/",
+        ),
+        # ===== 应急避险 =====
+        KnowledgeItem(
+            id="know-emergency-earthquake",
+            theme="应急避险",
+            category="地震避险",
+            title="地震时先躲避、后撤离，不乘电梯不跳楼",
+            risk_level="高风险",
+            typical_phrase="地震了快跑下楼，坐电梯更快。",
+            recognition_points="地震时慌乱外跑、乘坐电梯、跳楼逃生、站在窗边或阳台。",
+            suggestions="室内选择结实家具旁或承重墙角落躲避；护住头颈；震后有序撤离到空旷地带；远离建筑物和高压线。",
+            source="应急管理部《地震避险要点》",
+            source_url="https://www.mem.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-emergency-flood",
+            theme="应急避险",
+            category="暴雨洪涝",
+            title="暴雨洪涝时避免涉水行走和靠近电力设备",
+            risk_level="高风险",
+            typical_phrase="积水不深，走过去应该没事。",
+            recognition_points="贸然涉水、靠近断落电线、在涵洞或地下空间停留、冒险通过漫水桥。",
+            suggestions="关注气象预警；不贸然通过积水路段；远离电线杆、变压器等电力设施；被困时向高处转移并报警求助。",
+            source="应急管理部 / 中国气象局",
+            source_url="https://www.mem.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-emergency-food",
+            theme="应急避险",
+            category="食物中毒",
+            title="食物中毒应立即停止进食并保留可疑食物",
+            risk_level="中风险",
+            typical_phrase="吃完外卖有点恶心，可能是吃撑了，睡一觉就好。",
+            recognition_points="集体用餐后出现呕吐腹泻、食用过期或来源不明食品、症状短期内集中出现。",
+            suggestions="立即停止食用可疑食物；保留食物样本和呕吐物；及时就医并报告学校后勤或疾控部门；注意夏季食品保存。",
+            source="国家卫生健康委员会",
+            source_url="http://www.nhc.gov.cn/",
+        ),
+    ]
+
+    # ── 再平衡：为其余 10 个主题各补充 2 条权威来源条目，使知识库真正多主题均衡 ──
+    knowledge_items_seed += [
+        # ===== 网络安全（补充）=====
+        KnowledgeItem(
+            id="know-net-social-eng",
+            theme="网络安全",
+            category="社交工程",
+            title="冒充好友或老师索要验证码是典型社工攻击",
+            risk_level="中风险",
+            typical_phrase="我是XX，微信登不上去了，帮我把验证码发我，或者借账号用一下。",
+            recognition_points="冒充熟人/老师索要验证码、以账号异常为由诱导交出密码、诱导关闭二次验证、要求代付或转账。",
+            suggestions="验证码与账号密码绝不外借；开启登录设备管理与异地登录提醒；遇熟人异常求助通过原有渠道核实。",
+            source="国家互联网应急中心（CNCERT）",
+            source_url="https://www.cert.org.cn/",
+        ),
+        KnowledgeItem(
+            id="know-net-qr",
+            theme="网络安全",
+            category="二维码安全",
+            title="来历不明的二维码与短链可能暗藏木马",
+            risk_level="中风险",
+            typical_phrase="扫码领红包/加群，长按识别即可，错过就没了。",
+            recognition_points="来历不明的二维码、短链接跳转、诱导下载未知 APP、扫码后要求输入个人信息或付款。",
+            suggestions="不扫陌生小广告二维码；长按识别前查看真实链接；手机开启安全软件；可疑链接复制到官方渠道核验。",
+            source="中央网信办《网络安全知识手册》",
+            source_url="https://www.cac.gov.cn/",
+        ),
+        # ===== 心理健康（补充）=====
+        KnowledgeItem(
+            id="know-mental-anxiety",
+            theme="心理健康",
+            category="焦虑识别",
+            title="持续过度担忧与惊恐发作需及时调节",
+            risk_level="中风险",
+            typical_phrase="一考试/答辩就心跳加速、手抖、想逃，但我说不清为什么。",
+            recognition_points="持续过度担忧、心慌胸闷、回避行为、影响睡眠与日常功能超过两周。",
+            suggestions="规律运动与呼吸训练可缓解；与信任的人倾诉；严重时到学校心理咨询中心或精神科评估。",
+            source="国家卫生健康委员会《焦虑障碍防治指南》",
+            source_url="http://www.nhc.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-mental-crisis",
+            theme="心理健康",
+            category="危机干预",
+            title="出现自伤念头应立即寻求专业帮助",
+            risk_level="高风险",
+            typical_phrase="活着没意思，感觉没人需要我。",
+            recognition_points="表达无望感、自伤自杀念头、突然交代后事、社交断联、情绪剧烈波动。",
+            suggestions="出现自伤念头立即联系学校心理中心/辅导员或拨打全国心理援助热线12356；陪伴不评判，尽快转介专业机构。",
+            source="教育部《关于加强学生心理健康管理工作的通知》",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        # ===== 消防安全（补充）=====
+        KnowledgeItem(
+            id="know-fire-lab",
+            theme="消防安全",
+            category="实验室安全",
+            title="违规混合危化品是实验室重大隐患",
+            risk_level="高风险",
+            typical_phrase="这点试剂随便混一下应该没事，别那么紧张。",
+            recognition_points="违规混合化学试剂、未按规定佩戴防护、危化品随意存放、实验时脱岗。",
+            suggestions="严格按操作规程使用危化品；熟悉洗眼器/喷淋与应急流程；发现泄漏立即撤离并报告老师。",
+            source="教育部《高等学校实验室安全规范》",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-fire-extinguisher",
+            theme="消防安全",
+            category="灭火自救",
+            title="初起火灾牢记「提拔握压」四步",
+            risk_level="中风险",
+            typical_phrase="着火了先拍照发群里，找人帮忙。",
+            recognition_points="不会使用灭火器、惊慌逃窜、重返火场取物、未第一时间报警。",
+            suggestions="记住提、拔、握、压四步；小火可扑救，火势蔓延立即撤离并拨打119；定期参加消防演练。",
+            source="应急管理部消防救援局",
+            source_url="https://www.119.gov.cn/",
+        ),
+        # ===== 交通安全（补充）=====
+        KnowledgeItem(
+            id="know-traffic-rideshare",
+            theme="交通安全",
+            category="乘车安全",
+            title="网约车全程平台交易并分享行程",
+            risk_level="中风险",
+            typical_phrase="司机说平台单取消了，私下转账便宜。",
+            recognition_points="司机诱导线下交易、偏离导航路线、要求去偏僻地点、深夜独行无分享行程。",
+            suggestions="全程平台下单并分享行程；核对车牌与司机信息；异常立即取消并报警；优先坐后排、系安全带。",
+            source="公安部交通管理局",
+            source_url="https://www.122.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-traffic-crowd",
+            theme="交通安全",
+            category="人群安全",
+            title="人群拥挤处防踩踏：不逆行、护头部",
+            risk_level="高风险",
+            typical_phrase="前面好热闹，挤进去看看。",
+            recognition_points="人员极度密集、单向通道、有人摔倒、出入口拥堵、情绪躁动。",
+            suggestions="发现拥挤立即停留在坚固物旁避免被推倒；顺人流移动不逆行；若摔倒蜷缩护头；听从现场指挥。",
+            source="应急管理部",
+            source_url="https://www.mem.gov.cn/",
+        ),
+        # ===== 求职就业（补充）=====
+        KnowledgeItem(
+            id="know-job-triparty",
+            theme="求职就业",
+            category="实习权益",
+            title="实习应尽量签订协议明确薪资工时",
+            risk_level="中风险",
+            typical_phrase="实习生不签协议，干满三个月再看表现。",
+            recognition_points="实习不签协议、无偿加班无补贴、以试岗为由不付报酬、扣押证件。",
+            suggestions="实习尽量签订实习协议明确岗位薪资工时；保留考勤与沟通记录；权益受损向学校就业中心或劳动监察投诉。",
+            source="教育部学生服务与素质发展中心",
+            source_url="https://www.ncss.cn/",
+        ),
+        KnowledgeItem(
+            id="know-job-grad-scam",
+            theme="求职就业",
+            category="就业防骗",
+            title="「保offer/内推」收费多为就业骗局",
+            risk_level="高风险",
+            typical_phrase="交两万块，保你进大厂，不过全退。",
+            recognition_points="声称内部名额、收费内推、伪造 offer、以培训费名义收费后失联。",
+            suggestions="正规内推不收费；offer 通过企业官方邮箱与系统核实；任何入职前收费均违法，警惕保offer话术。",
+            source="人力资源和社会保障部",
+            source_url="http://www.mohrss.gov.cn/",
+        ),
+        # ===== 金融素养（补充）=====
+        KnowledgeItem(
+            id="know-finance-invest-basic",
+            theme="金融素养",
+            category="理财基础",
+            title="高收益必然伴随高风险，先保障后投资",
+            risk_level="低风险",
+            typical_phrase="这个产品稳赚8%，比存款划算多了。",
+            recognition_points="把高收益当无风险、不了解底层资产、盲目跟风、忽略流动性与费用。",
+            suggestions="先建立应急储备再考虑投资；理解风险与收益匹配；通过银行/券商等持牌机构配置；不碰不理解的产品。",
+            source="国家金融监督管理总局",
+            source_url="http://www.cbirc.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-finance-insurance",
+            theme="金融素养",
+            category="保险认知",
+            title="先保障后理财，看清免责条款",
+            risk_level="中风险",
+            typical_phrase="这份保险交十年返本还分红，稳赚不赔。",
+            recognition_points="把保险当理财、夸大收益隐瞒免责、诱导长期缴费、退保损失高。",
+            suggestions="先保障后理财；看清保障责任与免责条款；犹豫期内可无损失退保；按真实需求配置医疗/意外/重疾。",
+            source="国家金融监督管理总局",
+            source_url="http://www.cbirc.gov.cn/",
+        ),
+        # ===== 学术诚信（补充）=====
+        KnowledgeItem(
+            id="know-academic-citation",
+            theme="学术诚信",
+            category="引用规范",
+            title="改写不注明出处仍属学术不端",
+            risk_level="中风险",
+            typical_phrase="改改措辞就不算抄了，查重能过。",
+            recognition_points="paraphrasing 不注明出处、拼凑多篇、过度引用、转引不标原出处。",
+            suggestions="使用学校查重系统自查；直接引用加引号并标注；间接引用也要注明；建立个人文献管理习惯。",
+            source="教育部《高等学校预防与处理学术不端行为办法》",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-academic-authorship",
+            theme="学术诚信",
+            category="研究署名",
+            title="按实际贡献署名，事先约定分工",
+            risk_level="中风险",
+            typical_phrase="老师把没参与的人也挂名了，大家都这样。",
+            recognition_points="不当署名、买卖署名、侵占他人成果、通讯作者责任不清。",
+            suggestions="按实际贡献署名并事先约定；尊重他人知识产权；署名争议通过导师或学术委员会协调。",
+            source="科技部《科研失信行为调查处理规则》",
+            source_url="https://www.most.gov.cn/",
+        ),
+        # ===== 个人信息保护（补充）=====
+        KnowledgeItem(
+            id="know-privacy-social",
+            theme="个人信息保护",
+            category="社交隐私",
+            title="晒证件与精确定位存在隐私泄露风险",
+            risk_level="中风险",
+            typical_phrase="发个定位打卡、晒下学生证，没什么吧。",
+            recognition_points="公开精确位置、晒证件/车票/登机牌、透露课程表与作息、允许陌生人查看动态。",
+            suggestions="关闭允许陌生人查看动态；敏感证件打码；分享位置仅对信任好友；定期清理旧动态。",
+            source="中央网信办《网络安全知识手册》",
+            source_url="https://www.cac.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-privacy-account",
+            theme="个人信息保护",
+            category="账号安全",
+            title="账号盗用链：改密、二次验证、通知好友",
+            risk_level="高风险",
+            typical_phrase="你的账号被盗发了诈骗链接，快点这个链接解冻。",
+            recognition_points="异地登录提醒、好友收到可疑链接、密码批量泄露、复用同一密码跨站。",
+            suggestions="不同平台不同密码并开启二次验证；用泄露查询工具核查；发现盗号立即改密并通知好友。",
+            source="国家互联网应急中心（CNCERT）",
+            source_url="https://www.cert.org.cn/",
+        ),
+        # ===== 校园安全（补充）=====
+        KnowledgeItem(
+            id="know-campus-stranger",
+            theme="校园安全",
+            category="线下安全",
+            title="陌生人约见选白天人多的公共场所",
+            risk_level="中风险",
+            typical_phrase="我是校外学长，晚上在操场聊聊兼职的事。",
+            recognition_points="陌生人约至偏僻地点、以学长/招聘为名套近乎、拒绝在公开场合见面。",
+            suggestions="约见选白天人多的校园公共场所；告知室友去向；感觉不对立即离开并联系保卫处。",
+            source="教育部学校安全教育平台",
+            source_url="https://www.xueanquan.com/",
+        ),
+        KnowledgeItem(
+            id="know-campus-bullying",
+            theme="校园安全",
+            category="冲突应对",
+            title="遭遇欺凌及时求助并保留证据",
+            risk_level="高风险",
+            typical_phrase="这事你别声张，不然有你好看。",
+            recognition_points="持续性排挤辱骂、肢体威胁、索要财物、威胁不许求助。",
+            suggestions="遭遇欺凌及时告知辅导员/家长或拨打12355；保留证据；不孤立受害者，勇敢求助。",
+            source="教育部等十一部门《加强中小学生欺凌综合治理方案》（高校参照）",
+            source_url="http://www.moe.gov.cn/",
+        ),
+        # ===== 应急避险（补充）=====
+        KnowledgeItem(
+            id="know-emergency-typhoon",
+            theme="应急避险",
+            category="极端天气",
+            title="台风高温等极端天气听从学校预警安排",
+            risk_level="中风险",
+            typical_phrase="台风而已，出去买个饭没事。",
+            recognition_points="忽视气象预警、台风天外出、高温下长时间户外活动、留守危房。",
+            suggestions="关注气象与学校预警；台风天不外出、远离广告牌与窗户；高温减少户外活动并补水；听从停课/疏散安排。",
+            source="中国气象局",
+            source_url="http://www.cma.gov.cn/",
+        ),
+        KnowledgeItem(
+            id="know-emergency-firstaid",
+            theme="应急避险",
+            category="现场急救",
+            title="有人倒地无呼吸立即胸外按压并呼救",
+            risk_level="中风险",
+            typical_phrase="有人晕倒了，先拍视频发群里。",
+            recognition_points="有人突然倒地无反应无呼吸、大出血、异物窒息、围观无人施救。",
+            suggestions="立即呼救并拨打120；无呼吸立即胸外按压（100-120次/分）；大出血直接压迫止血；参加学校急救培训。",
+            source="中国红十字会总会",
+            source_url="https://www.redcross.org.cn/",
+        ),
+    ]
+
+    # 为历史反诈条目补充来源（新数据库自动带默认值，此处兜底兼容旧 seed 写法）
+    REMOVED = set(REMOVED_KNOWLEDGE_IDS)
+    for item in knowledge_items_seed:
+        if item.id in REMOVED:
+            continue
+        # 彻底移除「反诈安全」主题：任何反诈安全条目不再进入知识库
+        if item.theme == "反诈安全":
+            continue
+        if not item.source and item.theme == "反诈安全":
+            item.source = "国家反诈中心《2025版防范电信网络诈骗宣传手册》"
+        if not session.get(KnowledgeItem, item.id):
+            session.add(item)
+
+    if not session.scalar(select(FraudCase).limit(1)):
+        session.add(
+            FraudCase(
+                id="case-phish-001",
+                title="仿冒校园服务网站的钓鱼页面",
+                fraud_type="钓鱼仿冒",
+                source_channel="校园论坛",
+                risk_level="高风险",
+                ai_confidence=0.91,
+                desensitized=True,
+                status="已生成训练题",
+                summary="仿冒教务系统的钓鱼网站诱导学生在陌生页面输入统一认证账号密码。",
+                risk_tags_json=json.dumps(["非官方域名", "索要账号密码", "页面高度仿冒"], ensure_ascii=False),
+            )
+        )
+
+    for pet_id, owner_id, pet_type, category, growth, last_training_at in RANKING_PETS:
+        user = session.scalar(select(User).where(User.owner_id == owner_id))
+        if not user:
+            user = User(owner_id=owner_id, has_completed_assessment=True, has_pet=True)
+            session.add(user)
+        if not session.scalar(select(Pet).where(Pet.pet_id == pet_id)):
+            level = pet_level(growth)
+            session.add(
+                Pet(
+                    pet_id=pet_id,
+                    owner_id=owner_id,
+                    pet_type=pet_type,
+                    pet_category=category,
+                    level=level,
+                    stage=pet_stage(level),
+                    growth_value=growth,
+                    last_training_at=last_training_at,
+                )
+            )
+
+    session.commit()
+
+
+def pet_to_response(pet: Pet) -> dict[str, object]:
+    current_min, next_value = level_bounds(pet.level)
+    return {
+        "petId": pet.pet_id,
+        "ownerId": pet.owner_id,
+        "type": pet.pet_type,
+        "category": pet.pet_category,
+        "petName": pet.pet_name or "",
+        "avatarEmoji": pet.avatar_emoji or "",
+        "level": pet.level,
+        "stage": pet.stage,
+        "growthValue": pet.growth_value,
+        "currentLevelMin": current_min,
+        "nextLevelValue": next_value,
+        "lastTrainingAt": pet.last_training_at.strftime("%Y-%m-%d %H:%M") if pet.last_training_at else "",
+    }
+
+
+# ==================== 微课视频库种子 ====================
+#
+# 以 CC0 / 免费可商用视频源构建「视频数据库」。所有条目均可溯源，便于后续替换为
+# 更符合主题的自有素材或国内可访问的源。前端播放失败时自动降级为模拟进度播放器。
+#
+# 说明：沙箱环境无法对外网做连通性校验，链接可能在部分网络（如中国大陆）被限制。
+# 若某条视频不可用，可在 video_library 表中替换 url 字段，或在前端触发降级播放器。
+
+VIDEO_LIBRARY_SEED: list[dict[str, object]] = [
+    # keywords 与 learning_market.THEME_TASK_PROFILES 的 match 对齐，用于按主题命中
+    {
+        "theme": "AI素养与智能工具应用",
+        "keywords": "AI 人工智能 智能工具 提示词 大模型 智能素养",
+        "title": "AI 工具素养导学",
+        "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
+        "thumbnail": "https://media.w3.org/2010/05/sintel/poster.png",
+        "duration_seconds": 52,
+        "source": "W3C 示例视频 (CC0)",
+        "source_url": "https://www.w3.org/2010/05/sintel/",
+    },
+    {
+        "theme": "网络安全",
+        "keywords": "网络安全 信息安全 网络攻防 数字安全",
+        "title": "网络安全意识导学",
+        "url": "https://media.w3.org/2010/05/bunny/trailer.mp4",
+        "thumbnail": "https://media.w3.org/2010/05/bunny/poster.png",
+        "duration_seconds": 34,
+        "source": "W3C 示例视频 (CC0)",
+        "source_url": "https://www.w3.org/2010/05/bunny/",
+    },
+    {
+        "theme": "心理健康",
+        "keywords": "心理 情绪 压力 睡眠",
+        "title": "心理健康与压力管理导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
+        "thumbnail": "",
+        "duration_seconds": 60,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme": "消防安全",
+        "keywords": "消防 火灾 用电安全",
+        "title": "消防安全导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+        "thumbnail": "",
+        "duration_seconds": 653,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "交通安全",
+        "keywords": "交通 骑行 出行安全",
+        "title": "出行安全导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4",
+        "thumbnail": "",
+        "duration_seconds": 15,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "求职就业",
+        "keywords": "求职 就业 招聘 实习 职场",
+        "title": "求职安全与权益导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4",
+        "thumbnail": "",
+        "duration_seconds": 15,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "金融素养",
+        "keywords": "金融 理财 投资 财商 消费",
+        "title": "金融素养与理性消费导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/SubaruOutbackOnStreetAndDirt.mp4",
+        "thumbnail": "",
+        "duration_seconds": 15,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "学术诚信",
+        "keywords": "学术 诚信 论文 引用 查重",
+        "title": "学术规范导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
+        "thumbnail": "",
+        "duration_seconds": 734,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "个人信息保护",
+        "keywords": "个人信息 隐私 数据保护",
+        "title": "个人信息与隐私保护导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/VolkswagenGTIReview.mp4",
+        "thumbnail": "",
+        "duration_seconds": 60,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "校园安全",
+        "keywords": "校园安全 治安 防盗 宿舍安全",
+        "title": "校园安全导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4",
+        "thumbnail": "",
+        "duration_seconds": 47,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    {
+        "theme":  "应急避险",
+        "keywords": "应急 避险 地震 台风 急救 防灾",
+        "title": "应急避险与急救导学",
+        "url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WhatCarCanYouMake.mp4",
+        "thumbnail": "",
+        "duration_seconds": 60,
+        "source": "Google 示例视频 (CC0)",
+        "source_url": "https://developers.google.com/",
+    },
+    # 通用兜底视频（任何未命中主题时使用）
+    {
+        "theme": "通用",
+        "keywords": "通用 默认 default",
+        "title": "通用学习导学",
+        "url": "https://media.w3.org/2010/05/sintel/trailer.mp4",
+        "thumbnail": "https://media.w3.org/2010/05/sintel/poster.png",
+        "duration_seconds": 52,
+        "source": "W3C 示例视频 (CC0)",
+        "source_url": "https://www.w3.org/2010/05/sintel/",
+    },
+]
+
+
+def seed_video_library(session: Session) -> None:
+    """初始化微课视频库。
+
+    仅在库为空时插入；若已存在则跳过，避免重复。所有视频均为 CC0 / 免费可商用，
+    并已标注来源页面，便于后续替换为主题更贴合的自有素材或国内可访问源。
+    """
+    if session.scalar(select(VideoLibrary).limit(1)):
+        return
+    for entry in VIDEO_LIBRARY_SEED:
+        session.add(
+            VideoLibrary(
+                theme=entry["theme"],
+                keywords=entry["keywords"],
+                title=entry["title"],
+                url=entry["url"],
+                thumbnail=entry.get("thumbnail") or None,
+                duration_seconds=entry["duration_seconds"],
+                source=entry["source"],
+                source_url=entry.get("source_url") or None,
+                enabled=True,
+            )
+        )
+    session.commit()
+
+
+def pick_video_for_theme(session: Session, theme: str) -> VideoLibrary | None:
+    """按主题命中视频库中的视频。
+
+    先精确匹配主题名，再按 keywords 子串匹配（与 THEME_TASK_PROFILES 的 match 对齐），
+    最后回退到「通用」兜底视频。
+    """
+    videos = session.scalars(select(VideoLibrary).where(VideoLibrary.enabled.is_(True))).all()
+    if not videos:
+        return None
+    for v in videos:
+        if v.theme == theme or theme in v.keywords:
+            return v
+    for v in videos:
+        if any(kw in theme for kw in v.keywords.split()):
+            return v
+    generic = session.scalar(select(VideoLibrary).where(VideoLibrary.theme == "通用").limit(2))
+    return generic
+
