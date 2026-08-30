@@ -1,0 +1,24 @@
+# 根 Dockerfile 构建上下文忽略（仅前端构建需要 01_source_main_demo/fraud-pet-demo 的内容）
+node_modules
+**/node_modules
+.git
+.workbuddy
+outputs
+backend/data
+**/*.sqlite3*
+**/*.sqlite
+**/*.db
+# 前端构建不需要的子目录
+01_source_main_demo/fraud-pet-demo/backend
+01_source_main_demo/fraud-pet-demo/alwayzz-landing
+# 本会话临时恢复脚本（非源码）
+**/_recover_*
+**/_revert_backup
+**/_sweep*.py
+**/_recover_plans.pkl
+# 文档与无关产物不进构建上下文
+*.md
+=0.0.5
+dist
+**/dist
+coverage

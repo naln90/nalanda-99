@@ -27,9 +27,13 @@ FROM nginx:alpine
 # 拷贝自定义 Nginx 配置
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
+# 拷贝启动入口（把监听端口改为 Railway 注入的 $PORT；本地未设置时默认 80）
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
 # 拷贝构建产物
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 EXPOSE 80
 
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["/docker-entrypoint.sh"]
