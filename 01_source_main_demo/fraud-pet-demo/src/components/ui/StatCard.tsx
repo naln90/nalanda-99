@@ -1,6 +1,6 @@
 import { type ReactNode } from 'react';
 import { cn } from '../../lib/utils';
-import { Card, CardAction, CardDescription, CardFooter, CardHeader, CardTitle } from './Card';
+import { Card, CardAction, CardFooter, CardHeader, CardTitle } from './Card';
 import { Badge } from './Badge';
 
 /**
@@ -30,7 +30,7 @@ const accentGradient: Record<NonNullable<StatCardProps['accent']>, string> = {
   danger: 'from-danger-50 to-card',
 };
 
-export function StatCard({ label, value, trend, footer, className, accent = 'primary' }: StatCardProps) {
+export function StatCard({ value, trend, footer, className, accent = 'primary' }: StatCardProps) {
   const trendIcon = trend?.direction === 'up' ? '↗' : trend?.direction === 'down' ? '↘' : '→';
   const trendClass =
     trend?.direction === 'up'

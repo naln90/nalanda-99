@@ -21,7 +21,6 @@ import type { AbilityDimension } from '../types';
 
 export default function AssessmentResultPage() {
   const navigate = useNavigate();
-  const currentUser = useAppStore((s) => s.currentUser);
   const assessmentResult = useAppStore((s) => s.assessmentResult);
   const isLoading = useAppStore((s) => s.isLoading);
 

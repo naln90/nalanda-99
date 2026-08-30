@@ -184,7 +184,6 @@ export default function ScenarioTrainingPage() {
               {reviewReport.identifiedEvidence.map((ev, i) => (
                 <Badge key={i} variant="success" size="sm">{ev}</Badge>
               ))}
-              )}
             </div>
           </div>
           <div className="app-card p-4 border-amber-200/60">
@@ -196,7 +195,6 @@ export default function ScenarioTrainingPage() {
               {reviewReport.missedEvidence.map((ev, i) => (
                 <Badge key={i} variant="warning" size="sm">{ev}</Badge>
               ))}
-              )}
             </div>
           </div>
         </div>

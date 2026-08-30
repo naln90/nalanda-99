@@ -15,7 +15,7 @@ import { useAppStore } from '../store/useAppStore';
 import { api } from '../api/client';
 import type { KnowledgeItem } from '../types';
 import { resolvePetAvatar } from '../lib/pet-utils';
-import { resolveThemeProfile, getHomeGreeting, getDailyTip } from '../lib/themeProfile';
+import { resolveThemeProfile, getDailyTip } from '../lib/themeProfile';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import RadarChart from '../components/effects/RadarChart';
