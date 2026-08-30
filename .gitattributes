@@ -1,0 +1,2 @@
+# 确保 shell 启动脚本在任意平台均以 LF 检出，避免容器内 shebang 因 CRLF 失效
+docker-entrypoint.sh text eol=lf
