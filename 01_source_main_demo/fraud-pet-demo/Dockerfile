@@ -36,4 +36,5 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 
 EXPOSE 80
 
-CMD ["/docker-entrypoint.sh"]
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["nginx", "-g", "daemon off;"]
